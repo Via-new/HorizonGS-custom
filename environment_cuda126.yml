@@ -1,0 +1,26 @@
+name: horizon_gs_126
+channels:
+  - pytorch
+  - pyg
+  - conda-forge
+  - defaults
+dependencies:
+  - cudatoolkit=12.6  # 升级CUDA版本到12.6
+  - python=3.8.19  # Python版本保持不变（3.8兼容多数库）
+  - pip=24.2
+  - pytorch=2.4.0  # 升级PyTorch以匹配CUDA 12.6（2.4.0官方支持CUDA 12.6）
+  - torchaudio=2.4.0  # 与PyTorch版本保持一致
+  - torchvision=0.19.0  # 与PyTorch 2.4.0匹配（0.19.x对应2.4.x）
+  - pytorch-scatter  # 保持不变，conda会自动匹配兼容版本
+  - pip:
+    - plyfile
+    - tensorboard
+    - tqdm
+    - einops
+    - wandb
+    - lpips
+    - laspy
+    - jaxtyping
+    - colorama
+    - opencv-python
+    - scikit-learn  # 移除了最后的git安装项

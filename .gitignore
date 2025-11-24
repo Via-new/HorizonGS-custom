@@ -12,5 +12,6 @@ data
 tensorboard_3d
 screenshots
 *.so
+SIBR_viewers
 
 submodules/Depth-Anything-V2/*
