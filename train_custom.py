@@ -106,7 +106,41 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     
     # 初始化场景 (加载相机、点云等数据)
     scene = Scene(dataset, gaussians, shuffle=False, logger=logger, weed_ratio=pipe.weed_ratio)
+
+    # ================= [修复开始] 手动修正相机类型 =================
+    # HorizonGS 的加载器可能没认出 street，这里我们根据文件名强制修正
+    logger.info("Fixing camera types based on filenames...")
+    aerial_count = 0
+    street_count = 0
     
+    # 遍历所有训练相机
+    for cam in scene.getTrainCameras():
+        # 获取小写文件名 (例如 "street/train/street_0001.jpg" 或 "street_0001.jpg")
+        img_name = cam.image_name.lower()
+        
+        if "street" in img_name:
+            cam.image_type = "street"
+            street_count += 1
+        elif "aerial" in img_name:
+            cam.image_type = "aerial"
+            aerial_count += 1
+        else:
+            # 默认归类 (防止遗漏)
+            cam.image_type = "aerial"
+            aerial_count += 1
+            
+    logger.info(f"Manual Classification Result: Aerial={aerial_count}, Street={street_count}")
+    
+    # 安全检查：如果还是没找到街景，强制关闭 camera_balance 防止崩溃
+    if street_count == 0 and pipe.camera_balance:
+        logger.warning("WARNING: No street cameras found even after manual fix! Disabling camera_balance.")
+        pipe.camera_balance = False
+    
+    # 同时更新一下场景的属性，以便 render 时也能用
+    scene.add_aerial = (aerial_count > 0)
+    scene.add_street = (street_count > 0)
+    # ================= [修复结束] =================
+
     # 设置 Gaussian 模型的训练参数 (优化器等)
     gaussians.training_setup(opt)
     

@@ -229,33 +229,52 @@ def render_sets(dataset, opt, pipe, iteration, skip_train, skip_test, ape_code, 
     主渲染逻辑：初始化模型和场景，并调用render_set进行渲染。
     """
     with torch.no_grad(): # 禁用梯度计算，节省显存并加速
-        # 根据配置设置是否启用预过滤步骤
         if pipe.no_prefilter_step > 0:
             pipe.add_prefilter = False
         else:
             pipe.add_prefilter = True
         
-        # 动态导入 scene 模块
         modules = __import__('scene')
         model_config = dataset.model_config
-        # 设置外观编码 (Appearance Code)
         model_config['kwargs']['ape_code'] = ape_code
-        # 根据配置名称实例化高斯模型
         gaussians = getattr(modules, model_config['name'])(**model_config['kwargs'])
-        # 初始化场景，加载指定的迭代模型，explicit控制是否显式加载
+        
+        # 初始化场景
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, explicit=explicit)
-        # 将模型设置为评估模式
+
+        # ================= [新增] 手动修正相机类型 (与 train.py 保持一致) =================
+        print("Fixing camera types for rendering based on filenames...")
+        aerial_count = 0
+        street_count = 0
+        
+        # 因为 eval=False，测试集图片被加载到了 TrainCameras 列表里
+        # 我们遍历所有相机进行修正
+        all_cameras = scene.getTrainCameras() + scene.getTestCameras()
+        
+        for cam in all_cameras:
+            img_name = cam.image_name.lower()
+            if "street" in img_name:
+                cam.image_type = "street"
+                street_count += 1
+            elif "aerial" in img_name:
+                cam.image_type = "aerial"
+                aerial_count += 1
+            else:
+                cam.image_type = "aerial" # 默认兜底
+                aerial_count += 1
+                
+        print(f"Render Set Classification: Aerial={aerial_count}, Street={street_count}")
+        # ==============================================================================
+
         gaussians.eval()
 
-        # 确保模型路径目录存在
         if not os.path.exists(dataset.model_path):
             os.makedirs(dataset.model_path)
         
-        # 如果不跳过训练集，渲染训练集视角
+        # 这里的 "train" 实际上对应的是你的测试集 (因为 eval=False)
         if not skip_train:
             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipe, scene.background, dataset.add_aerial, dataset.add_street)
 
-        # 如果不跳过测试集，渲染测试集视角
         if not skip_test:
             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipe, scene.background, dataset.add_aerial, dataset.add_street)
 
