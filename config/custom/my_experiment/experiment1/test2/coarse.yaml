@@ -21,7 +21,7 @@ model_params: {
     'pretrained_checkpoint': '',     # 预训练模型路径（空表示从头开始训练）
     'global_appearance': '',         # 全局外观模型路径
     'dataset_name': my_experiment, # 数据集名称
-    'scene_name': base_experiment/coarse,  # 具体场景名称/子文件夹
+    'scene_name': experiment1/test2/coarse,  # 具体场景名称/子文件夹
     'images': images,                # 图片文件夹名称
     'resolution': -1,                # 图片分辨率缩放（-1 表示使用原始分辨率）
     'white_background': False,       # 是否使用纯白背景（实景数据通常为False，合成数据为True）
@@ -31,7 +31,7 @@ model_params: {
     'eval': True,                   # 是否开启评估模式
     'ratio': 1,                      # 数据下采样比例
     'data_format': colmap,           # 相机姿态数据格式（COLMAP）
-    'add_mask': False,               # 是否加载遮罩（Mask）图像
+    'add_mask': True,               # 是否加载遮罩（Mask）图像
     'add_depth': False,              # 是否加载深度图（GT Depth）
     'add_aerial': True,              # 是否加载航拍数据子集
     'add_street': True,              # 是否加载街景数据子集

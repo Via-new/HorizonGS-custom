@@ -21,7 +21,7 @@ model_params: {
     'pretrained_checkpoint': '',     # 预训练模型路径（空表示从头开始训练）
     'global_appearance': '',         # 全局外观模型路径
     'dataset_name': my_experiment, # 数据集名称
-    'scene_name': base_experiment/coarse,  # 具体场景名称/子文件夹
+    'scene_name': experiment1/test5/coarse,  # 具体场景名称/子文件夹
     'images': images,                # 图片文件夹名称
     'resolution': -1,                # 图片分辨率缩放（-1 表示使用原始分辨率）
     'white_background': False,       # 是否使用纯白背景（实景数据通常为False，合成数据为True）
@@ -31,7 +31,7 @@ model_params: {
     'eval': True,                   # 是否开启评估模式
     'ratio': 1,                      # 数据下采样比例
     'data_format': colmap,           # 相机姿态数据格式（COLMAP）
-    'add_mask': False,               # 是否加载遮罩（Mask）图像
+    'add_mask': True,               # 是否加载遮罩（Mask）图像
     'add_depth': False,              # 是否加载深度图（GT Depth）
     'add_aerial': True,              # 是否加载航拍数据子集
     'add_street': True,              # 是否加载街景数据子集
@@ -97,7 +97,7 @@ optim_params: {
     'lambda_dssim': 0.200000,        # SSIM（结构相似性）损失权重
     'lambda_dreg': 0.010000,         # 正则化损失权重（通常用于限制高斯球大小，防止过大）
     'lambda_sky_opa': 0.050000,      # 天空不透明度损失（强制天空区域透明）
-    'lambda_opacity_entropy': 0.050000, # 不透明度熵损失（鼓励不透明度趋向0或1，减少半透明雾）
+    'lambda_opacity_entropy': 0.000000, # 不透明度熵损失（鼓励不透明度趋向0或1，减少半透明雾）
     'lambda_normal': 0.000000,       # 法线约束损失（此处未启用）
     'normal_start_iter': 7000,       # 法线损失开始迭代的轮次
     'lambda_dist': 0.000000,         # 畸变损失（Distortion Loss，此处未启用）

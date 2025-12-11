@@ -12,6 +12,8 @@
 import os
 import shutil
 import numpy as np
+import json
+import struct
 
 import subprocess
 # 构建命令查询 nvidia-smi 的显存信息
@@ -91,6 +93,36 @@ def saveRuntimeCode(dst: str) -> None:
     
     print('Backup Finished!')
 
+# ================= [DIAGNOSIS HELPER FUNCTIONS START] =================
+def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
+    data = fid.read(num_bytes)
+    return struct.unpack(endian_character + format_char_sequence, data)
+
+def read_images_binary_debug(path_to_model_file):
+    images = {}
+    try:
+        with open(path_to_model_file, "rb") as fid:
+            num_reg_images = read_next_bytes(fid, 8, "Q")[0]
+            for _ in range(num_reg_images):
+                binary_image_properties = read_next_bytes(fid, 64, "i4d3di")
+                image_id = binary_image_properties[0]
+                qvec = np.array(binary_image_properties[1:5])
+                tvec = np.array(binary_image_properties[5:8])
+                camera_id = binary_image_properties[8]
+                image_name = ""
+                current_char = read_next_bytes(fid, 1, "c")[0]
+                while current_char != b"\x00":
+                    image_name += current_char.decode("utf-8")
+                    current_char = read_next_bytes(fid, 1, "c")[0]
+                num_points2D = read_next_bytes(fid, 8, "Q")[0]
+                # Skip points data
+                fid.seek(24 * num_points2D, 1)
+                images[image_id] = {"id": image_id, "name": image_name}
+    except Exception as e:
+        print(f"[DEBUG READ ERROR] {e}")
+    return images
+# ================= [DIAGNOSIS HELPER FUNCTIONS END] =================
+
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, wandb=None, logger=None, ply_path=None):
     """
     主训练函数。
@@ -104,18 +136,40 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     model_config = dataset.model_config
     gaussians = getattr(modules, model_config['name'])(**model_config['kwargs'])
     
+    # ================= [DIAGNOSIS LOGIC START] =================
+    # 为了避免刷屏，这里的诊断信息只在初始化时运行一次
+    logger.info("\n" + "="*20 + " 深度参数与COLMAP一致性检查 " + "="*20)
+    json_path = os.path.join(dataset.source_path, "sparse", "0", "depth_params.json")
+    
+    if os.path.exists(json_path):
+        logger.info(f"[JSON] 发现文件: {json_path}")
+        # 简单检查一下文件是否能读取
+        try:
+            with open(json_path, 'r') as f:
+                json.load(f)
+            logger.info(f"[JSON] 文件格式正确。")
+        except Exception as e:
+            logger.error(f"[JSON] 文件损坏: {e}")
+    else:
+        logger.error(f"[JSON] 警告: 未找到 {json_path}。如果开启了 add_depth，这将导致报错。")
+    logger.info("="*60 + "\n")
+    # ================= [DIAGNOSIS LOGIC END] =================
+
     # 初始化场景 (加载相机、点云等数据)
     scene = Scene(dataset, gaussians, shuffle=False, logger=logger, weed_ratio=pipe.weed_ratio)
 
     # ================= [修复开始] 手动修正相机类型 =================
-    # HorizonGS 的加载器可能没认出 street，这里我们根据文件名强制修正
     logger.info("Fixing camera types based on filenames...")
     aerial_count = 0
     street_count = 0
     
-    # 遍历所有训练相机
+    # [NEW] 统计 Depth 和 Mask 的加载情况
+    depth_loaded_count = 0
+    mask_loaded_count = 0
+    total_train_cams = len(scene.getTrainCameras())
+
     for cam in scene.getTrainCameras():
-        # 获取小写文件名 (例如 "street/train/street_0001.jpg" 或 "street_0001.jpg")
+        # 获取小写文件名
         img_name = cam.image_name.lower()
         
         if "street" in img_name:
@@ -125,18 +179,42 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             cam.image_type = "aerial"
             aerial_count += 1
         else:
-            # 默认归类 (防止遗漏)
             cam.image_type = "aerial"
             aerial_count += 1
+        
+        # [NEW] 检查 Depth (invdepthmap 存在即表示读取成功)
+        if cam.invdepthmap is not None:
+            depth_loaded_count += 1
+            
+        # [NEW] 检查 Mask (alpha_mask 存在即表示读取成功)
+        if cam.alpha_mask is not None:
+            mask_loaded_count += 1
             
     logger.info(f"Manual Classification Result: Aerial={aerial_count}, Street={street_count}")
     
-    # 安全检查：如果还是没找到街景，强制关闭 camera_balance 防止崩溃
+    # [NEW] 打印 Depth 和 Mask 的统计信息 (只打印一次)
+    logger.info("-" * 50)
+    logger.info(f"数据加载完整性检查 (训练集):")
+    logger.info(f"  总相机数 (Total Cameras) : {total_train_cams}")
+    logger.info(f"  深度图 (Depth Maps)      : {depth_loaded_count} / {total_train_cams} ({(depth_loaded_count/total_train_cams)*100:.1f}%)")
+    logger.info(f"  掩码图 (Masks)           : {mask_loaded_count} / {total_train_cams} ({(mask_loaded_count/total_train_cams)*100:.1f}%)")
+    
+    if dataset.add_depth and depth_loaded_count < total_train_cams:
+        logger.warning(f"警告: 已开启 add_depth，但有 {total_train_cams - depth_loaded_count} 张图片未加载到深度图！")
+    elif dataset.add_depth:
+        logger.info("成功: 所有相机的深度图已成功加载。")
+
+    if dataset.add_mask and mask_loaded_count < total_train_cams:
+        logger.warning(f"警告: 已开启 add_mask，但有 {total_train_cams - mask_loaded_count} 张图片未加载到掩码！")
+    elif dataset.add_mask:
+        logger.info("成功: 所有相机的掩码已成功加载。")
+    logger.info("-" * 50)
+
+    # 安全检查
     if street_count == 0 and pipe.camera_balance:
         logger.warning("WARNING: No street cameras found even after manual fix! Disabling camera_balance.")
         pipe.camera_balance = False
     
-    # 同时更新一下场景的属性，以便 render 时也能用
     scene.add_aerial = (aerial_count > 0)
     scene.add_street = (street_count > 0)
     # ================= [修复结束] =================
@@ -156,7 +234,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     # 获取深度 L1 损失权重的指数衰减函数
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    # 如果启用了相机平衡策略 (用于混合航拍和街景数据)
     if pipe.camera_balance:
         aerial_viewpoint_stack = None
         street_viewpoint_stack = None
@@ -167,15 +244,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_Ll1depth_for_log = 0.0
     densify_cnt = 0
     
-    # 初始化进度条
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress",dynamic_ncols=True)
+    # [NEW] 优化进度条设置：leave=True(保留进度条), dynamic_ncols=True(自适应宽度), mininterval=0.5(减少刷新频率)
+    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress", leave=True, dynamic_ncols=True, mininterval=0.5)
     first_iter += 1
     modules = __import__('gaussian_renderer')
     
     # --- 开始训练循环 ---
     for iteration in range(first_iter, opt.iterations + 1):        
-        # 尝试连接网络 GUI (可视化调试工具)
-        # network gui not available in Horizon-gs yet
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -183,7 +258,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 net_image_bytes = None
                 custom_cam, do_training, pipe.add_prefilter, keep_alive = network_gui.receive()
                 if custom_cam != None:
-                    # 如果 GUI 发送了自定义相机视角，则渲染该视角
                     net_image = getattr(modules, 'render')(custom_cam, gaussians, pipe, scene.background)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
@@ -199,22 +273,19 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         # --- 选择一个随机相机进行训练 ---
         if pipe.camera_balance:
-            # 如果启用了相机平衡，分别维护航拍和街景的相机栈
-            if not aerial_viewpoint_stack: #先把所有的相机位姿取出来
+            if not aerial_viewpoint_stack:
                 aerial_viewpoint_stack = [cam for cam in scene.getTrainCameras().copy() if cam.image_type == "aerial"]
             if not street_viewpoint_stack:
                 street_viewpoint_stack = [cam for cam in scene.getTrainCameras().copy() if cam.image_type == "street"]
             
-            # 根据配置的比例 (例如 2:1) 决定本次迭代取航拍还是街景
             aerial_proportion, street_proportion = pipe.camera_proportion.split("-")
             r = float(aerial_proportion) / ( float(aerial_proportion) + float(street_proportion) )
-            if np.random.rand() < r: # 如果生成的随机数 (0~1之间) 小于 0.66，就进这里（66%的概率）
+            if np.random.rand() < r:
                 viewpoint_cam = aerial_viewpoint_stack.pop(randint(0, len(aerial_viewpoint_stack)-1))
             else:
                 viewpoint_cam = street_viewpoint_stack.pop(randint(0, len(street_viewpoint_stack)-1))
         else:
-            # 标准随机采样
-            if not viewpoint_stack: #把所有相机（航拍+街景）混在一个大池子 viewpoint_stack 里。
+            if not viewpoint_stack:
                 viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
@@ -222,22 +293,19 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         render_pkg = getattr(modules, 'render')(viewpoint_cam, gaussians, pipe, scene.background)
         image, scaling, alpha = render_pkg["render"], render_pkg["scaling"], render_pkg["render_alphas"]
 
-        # 获取真值图像和 Alpha 掩码
         gt_image = viewpoint_cam.original_image.cuda()
         alpha_mask = viewpoint_cam.alpha_mask.cuda()
         
-        # 应用掩码 (只计算有效区域)
+        # 应用掩码
         image = image * alpha_mask
         gt_image = gt_image * alpha_mask
             
         # --- 计算基础损失 ---
         Ll1 = l1_loss(image, gt_image)
         ssim_loss = (1.0 - ssim(image, gt_image))
-        # 总损失 = L1 + D-SSIM
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
        
         # --- 计算正则化损失 ---
-        # 缩放正则化 (防止高斯球过大)
         if opt.lambda_dreg > 0:
             if scaling.shape[0] > 0:
                 scaling_reg = scaling.prod(dim=1).mean()
@@ -245,47 +313,37 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 scaling_reg = torch.tensor(0.0, device="cuda")
             loss += opt.lambda_dreg * scaling_reg
         
-        # 天空不透明度损失 (强制天空部分透明/不渲染)
         if opt.lambda_sky_opa > 0:
             o = alpha.clamp(1e-6, 1-1e-6)
             sky = alpha_mask.float()
-            # 这里的逻辑是：如果 alpha_mask 是天空(假设mask里天空是0?)，则希望渲染出的不透明度 o 接近 0
             loss_sky_opa = (-(1-sky) * torch.log(1 - o)).mean()
             loss = loss + opt.lambda_sky_opa * loss_sky_opa
 
-        # 不透明度熵损失 (鼓励不透明度趋向于 0 或 1，减少半透明伪影)
         if opt.lambda_opacity_entropy > 0:
             o = alpha.clamp(1e-6, 1 - 1e-6)
             loss_opacity_entropy = -(o*torch.log(o)).mean()
             loss = loss + opt.lambda_opacity_entropy * loss_opacity_entropy
 
-        # 法线约束损失 (如果配置启用且超过起始迭代)
         if opt.lambda_normal > 0 and iteration > opt.normal_start_iter:
             assert gaussians.render_mode=="RGB+ED" or gaussians.render_mode=="RGB+D"
-            # 渲染出的法线
             normals = render_pkg["render_normals"].squeeze(0).permute((2, 0, 1))
-            # 从深度图推导出的法线 (伪真值)
             normals_from_depth = render_pkg["render_normals_from_depth"] * render_pkg["render_alphas"].permute((1, 2, 0)).detach()
             if len(normals_from_depth.shape) == 4:
                 normals_from_depth = normals_from_depth.squeeze(0)
             normals_from_depth = normals_from_depth.permute((2, 0, 1))
-            # 计算两者的一致性损失
             normal_error = (1 - (normals * normals_from_depth).sum(dim=0))[None]
             loss += opt.lambda_normal * (normal_error * alpha_mask).mean()
 
-        # 畸变损失 (Distortion loss，用于减少漂浮物)
         if opt.lambda_dist and iteration > opt.dist_start_iter:
             loss += opt.lambda_dist * (render_pkg["render_distort"].squeeze(3) * alpha_mask).mean()
         
-        # 深度损失 (使用单目深度估计作为监督)
+        # 深度损失
         if iteration > opt.start_depth and depth_l1_weight(iteration) > 0 and viewpoint_cam.invdepthmap is not None:
             assert gaussians.render_mode=="RGB+ED" or gaussians.render_mode=="RGB+D"
             render_depth = render_pkg["render_depth"]
-            # 将渲染深度转换为逆深度
             invDepth = torch.where(render_depth > 0.0, 1.0 / render_depth, torch.zeros_like(render_depth))            
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
-            # 计算深度 L1 损失
             Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
             Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
             loss += Ll1depth
@@ -299,37 +357,31 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         iter_end.record()
 
         with torch.no_grad():
-            # 更新进度条显示
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
                 psnr_log = psnr(image, gt_image).mean().double()
-                anchor_prim = len(gaussians.get_anchor) # 获取当前高斯点数量
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{5}f}","Depth Loss": f"{ema_Ll1depth_for_log:.{5}f}","psnr":f"{psnr_log:.{3}f}","GS_num":f"{anchor_prim}","prefilter":f"{pipe.add_prefilter}"})
+                anchor_prim = len(gaussians.get_anchor) 
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}","Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}","psnr":f"{psnr_log:.{3}f}","GS_num":f"{anchor_prim}","prefilter":f"{pipe.add_prefilter}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # 记录日志到 Tensorboard / WandB
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, getattr(modules, 'render'), (pipe, scene.background), wandb, logger)
             
-            # 保存高斯模型 (Ply文件)
             if (iteration in saving_iterations):
-                logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
+                # [NEW] 使用 tqdm.write 避免破坏进度条格式
+                tqdm.write(f"[ITER {iteration}] Saving Gaussians")
                 scene.save(iteration)
 
-            # 定期可视化 (保存渲染图、深度图等)
             if iteration % pipe.vis_step == 0 or iteration == 1:
-                # render_img/gt_img/render_depth/gt_depth/render_alphas/masks
                 other_img = []
-                # 降采样以方便保存
                 resolution = (int(viewpoint_cam.image_width/5.0), int(viewpoint_cam.image_height/5.0))
                 vis_img = F.interpolate(image.unsqueeze(0), size=(resolution[1], resolution[0]), mode='bilinear', align_corners=False)[0]
                 vis_gt_img = F.interpolate(gt_image.unsqueeze(0), size=(resolution[1], resolution[0]), mode='bilinear', align_corners=False)[0]
                 vis_alpha = F.interpolate(alpha.repeat(3, 1, 1).unsqueeze(0), size=(resolution[1], resolution[0]), mode='bilinear', align_corners=False)[0]
 
-                # 如果有深度信息，也进行可视化
                 if iteration > opt.start_depth and viewpoint_cam.invdepthmap is not None:
                     vis_depth = visualize_depth(invDepth) 
                     gt_depth = visualize_depth(mono_invdepth)
@@ -338,7 +390,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     other_img.append(vis_depth)
                     other_img.append(vis_gt_depth)
                 
-                # 拼接成网格图并保存
                 grid = torchvision.utils.make_grid([
                     vis_img, 
                     vis_gt_img, 
@@ -349,38 +400,32 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 os.makedirs(vis_path, exist_ok=True)
                 torchvision.utils.save_image(grid, os.path.join(vis_path, f"{iteration:05d}_{viewpoint_cam.colmap_id:03d}.png"))
             
-            # --- 致密化 (Densification) 与 剪枝 (Pruning) ---
             if iteration < opt.update_until and iteration > opt.start_stat:
-                # 收集梯度统计信息
                 if  (viewpoint_cam.image_type == "aerial" and pipe.aerial_densify) \
                     or (viewpoint_cam.image_type == "street" and pipe.street_densify) :
                     gaussians.training_statis(opt, render_pkg, image.shape[2], image.shape[1])
                     densify_cnt += 1 
 
-                # 执行致密化操作 (克隆或分裂高斯)
                 if opt.densification and iteration > opt.update_from and densify_cnt > 0 and densify_cnt % opt.update_interval == 0:
                     if dataset.pretrained_checkpoint != "":
-                        gaussians.roll_back() # 如果是微调，可能需要回滚
+                        gaussians.roll_back()
                     gaussians.run_densify(opt, iteration)
             
-            # 达到停止更新迭代次数时的清理
             elif iteration == opt.update_until:
                 if dataset.pretrained_checkpoint != "":
                     gaussians.roll_back()
                 gaussians.clean()
                     
-            # --- 优化器步进 ---
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
-            # 在最后阶段关闭预过滤 (prefilter)
             if iteration >= opt.iterations - pipe.no_prefilter_step:
                 pipe.add_prefilter = False
 
-            # 保存 Checkpoint (.pth 文件)
             if (iteration in checkpoint_iterations):
-                logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
+                # [NEW] 使用 tqdm.write
+                tqdm.write(f"[ITER {iteration}] Saving Checkpoint")
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):
@@ -394,13 +439,11 @@ def prepare_output_and_logger(args):
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
         
-    # 设置输出文件夹
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # 创建 Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
@@ -420,12 +463,10 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
     if wandb is not None:
         wandb.log({"train_l1_loss":Ll1, 'train_total_loss':loss, })
     
-    # 报告测试集和训练集采样的评估结果
     if iteration in testing_iterations:
         scene.gaussians.eval()
         torch.cuda.empty_cache()
         
-        # 定义验证配置：完整的测试集和采样的训练集
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                             {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx] for idx in range(0, len(scene.getTrainCameras()), 100)]})
 
@@ -445,14 +486,12 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
 
                 for idx, viewpoint in enumerate(config['cameras']):
                     
-                    # 渲染并计算误差
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     alpha_mask = viewpoint.alpha_mask.cuda()
                     image = image * alpha_mask
                     gt_image = gt_image * alpha_mask
                     
-                    # 记录前几张图片到 Tensorboard / WandB
                     if tb_writer and (idx < 30):
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=iteration)
@@ -466,7 +505,6 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                         if wandb:
                             gt_image_list.append(gt_image[None])
                 
-                    # 分别统计航拍和街景的指标
                     if viewpoint.image_type == "aerial":
                         l1_test_aerial += l1_loss(image, gt_image).mean().double()
                         psnr_test_aerial += psnr(image, gt_image).mean().double()
@@ -476,15 +514,15 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                         psnr_test_street += psnr(image, gt_image).mean().double()
                         street_cnt += 1 
                 
-                # 打印并记录平均指标
+                # [NEW] 使用 tqdm.write 避免破坏进度条
                 if scene.add_aerial and aerial_cnt > 0:
                     l1_test_aerial /= aerial_cnt
                     psnr_test_aerial /= aerial_cnt    
-                    logger.info("\n[ITER {}] Evaluating {} Aerial: L1 {} PSNR {}".format(iteration, config['name'], l1_test_aerial, psnr_test_aerial))
+                    tqdm.write("[ITER {}] Evaluating {} Aerial: L1 {} PSNR {}".format(iteration, config['name'], l1_test_aerial, psnr_test_aerial))
                 if scene.add_street and street_cnt > 0:       
                     l1_test_street /= street_cnt
                     psnr_test_street /= street_cnt       
-                    logger.info("\n[ITER {}] Evaluating {} Street: L1 {} PSNR {}".format(iteration, config['name'], l1_test_street, psnr_test_street))
+                    tqdm.write("[ITER {}] Evaluating {} Street: L1 {} PSNR {}".format(iteration, config['name'], l1_test_street, psnr_test_street))
                 
         if tb_writer:
             tb_writer.add_scalar(f'{dataset_name}/'+'total_points', len(scene.gaussians.get_anchor), iteration)
@@ -496,7 +534,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipe, background, 
     """
     渲染指定的数据集（train/test），保存图像、误差图和真值。
     """
-    # 创建保存目录
     if add_aerial:
         aerial_render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "aerial", "renders")
         aerial_error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "aerial", "errors")
@@ -514,7 +551,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipe, background, 
 
     modules = __import__('gaussian_renderer')
 
-    # --- 渲染街景视图 ---
     street_t_list = []
     street_visible_count_list = []
     street_per_view_dict = {}
@@ -527,34 +563,28 @@ def render_set(model_path, name, iteration, views, gaussians, pipe, background, 
 
         street_t_list.append(t_end - t_start)
 
-        # 获取渲染结果和可见性计数
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
         visible_count = render_pkg["visibility_filter"].sum()
 
-        # 处理真值和掩码
         gt = view.original_image.cuda()
         alpha_mask = view.alpha_mask.cuda()
         rendering = torch.cat([rendering, alpha_mask], dim=0)
         gt = torch.cat([gt, alpha_mask], dim=0)
         
-        # 计算误差图
         if gt.device != rendering.device:
             rendering = rendering.to(gt.device)
         errormap = (rendering - gt).abs()
 
-        # 保存图片
         save_rgba(rendering, os.path.join(street_render_path, '{0:05d}'.format(idx) + ".png"))
         save_rgba(errormap, os.path.join(street_error_path, '{0:05d}'.format(idx) + ".png"))
         save_rgba(gt, os.path.join(street_gts_path, '{0:05d}'.format(idx) + ".png"))
         street_visible_count_list.append(visible_count)
         street_per_view_dict['{0:05d}'.format(idx) + ".png"] = visible_count.item()
     
-    # 保存每张视图的可见点计数
     if len(street_views) > 0:
         with open(os.path.join(model_path, name, "ours_{}".format(iteration), "street", "per_view_count.json"), 'w') as fp:
             json.dump(street_per_view_dict, fp, indent=True)
     
-    # --- 渲染航拍视图 ---
     aerial_t_list = []
     aerial_visible_count_list = []
     aerial_per_view_dict = {}
@@ -567,22 +597,18 @@ def render_set(model_path, name, iteration, views, gaussians, pipe, background, 
 
         aerial_t_list.append(t_end - t_start)
 
-        # 渲染
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
         visible_count = render_pkg["visibility_filter"].sum()
 
-        # 真值
         gt = view.original_image.cuda()
         alpha_mask = view.alpha_mask.cuda()
         rendering = torch.cat([rendering, alpha_mask], dim=0)
         gt = torch.cat([gt, alpha_mask], dim=0)
         
-        # 误差图
         if gt.device != rendering.device:
             rendering = rendering.to(gt.device)
         errormap = (rendering - gt).abs()
 
-        # 保存
         save_rgba(rendering, os.path.join(aerial_render_path, '{0:05d}'.format(idx) + ".png"))
         save_rgba(errormap, os.path.join(aerial_error_path, '{0:05d}'.format(idx) + ".png"))
         save_rgba(gt, os.path.join(aerial_gts_path, '{0:05d}'.format(idx) + ".png"))
@@ -695,6 +721,8 @@ def evaluate(model_paths, eval_name, aerial_visible_count=None, street_visible_c
                 logger.info("  Held-out STREET_SSIM : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(ssims[72:-1]).mean(), ".5"))
                 logger.info("  Held-out STREET_LPIPS: \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(lpipss[72:-1]).mean(), ".5"))
                 logger.info("  Held-out STREET_GS_NUMS: \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(street_visible_count[72:-1]).float().mean(), ".5"))
+                
+                # ... (省略重复的日志打印部分) ...
                 
                 # 更新结果字典
                 full_dict[scene_dir][method].update({

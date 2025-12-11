@@ -249,9 +249,110 @@ def render_continuous_loop(img_queue, dataset, pipe, iteration, ape_code, explic
                 view.camera_center = view.world_view_transform.inverse()[3, :3]
 
                 render_pkg = getattr(renderer_modules, 'render')(view, gaussians, pipe, background)
-                rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
                 
-                img_np = rendering.detach().permute(1, 2, 0).cpu().numpy()
+                # ========================== 修改开始 ==========================
+                # 检查是否存在深度信息 (HorizonGS 通常使用 "render_depth")
+                if "render_depth" in render_pkg:
+                    depth = render_pkg["render_depth"]
+                elif "depth" in render_pkg:
+                    depth = render_pkg["depth"]
+                elif "expected_depth" in render_pkg: # 部分版本可能是这个名字
+                    depth = render_pkg["expected_depth"]
+                else:
+                    # 如果没找到深度，回退到 RGB 的红色通道防止报错
+                    depth = render_pkg["render"][0:1, :, :]
+                    print("[Warning] No depth channel found in render_pkg!")
+
+                # # 1. 归一化深度 (Min-Max Normalization)
+                # # 将物理深度值映射到 0.0 - 1.0 之间，以便可视化
+                # # .detach() 是必须的，因为不需要计算梯度
+                # depth_min = depth.min()
+                # depth_max = depth.max()
+                
+                # # 防止除以零
+                # if depth_max - depth_min > 1e-6:
+                #     depth_norm = (depth - depth_min) / (depth_max - depth_min)
+                # else:
+                    # depth_norm = torch.zeros_like(depth)
+                # # 1. 归一化深度 (简单截断法 - 修正全蓝问题)
+                # # 设定最大观测距离。
+                # # 建议设置小一点 (例如 30.0 或 50.0)，这样近处的建筑物颜色才会丰富。
+                # max_vis_depth = 2.0 
+                
+                # # 【关键步骤】超过 max_vis_depth 的远景强制截断
+                # # 这样天空会变成纯红，近处物体就能分摊 0~1 的色彩范围
+                # depth = torch.clamp(depth, min=0.0, max=max_vis_depth)
+                
+                # depth_min = depth.min()
+                
+                # # 分母固定为 (截断值 - 最小值)，保证色彩绝对对应距离
+                # if max_vis_depth - depth_min > 1e-6:
+                #     depth_norm = (depth - depth_min) / (max_vis_depth - depth_min)
+                # else:
+                #     depth_norm = torch.zeros_like(depth)
+
+                # ========================== 替换开始 ==========================
+                # 方案 C：智能百分比自动适应 (Auto-Exposure for Depth)
+                # 不再硬猜 max_vis_depth 是 5 还是 80
+                
+                # 1. 为了防止计算过慢，先转到 CPU 并展平
+                flat_depth = depth.detach().cpu().flatten()
+                
+                # 2. 打印调试信息 (这样你就知道真实的深度到底是多少了！)
+                # 为了防止刷屏，每隔 30 帧打印一次，或者观察控制台
+                # 现在的场景尺度看起来非常小，可能是 0.x
+                d_min_val = flat_depth.min().item()
+                d_max_val = flat_depth.max().item()
+                # print(f"\rDepth Stats: Min={d_min_val:.4f}, Max={d_max_val:.4f}", end="", flush=True)
+
+                # 3. 计算分位数 (Quantiles)
+                # min_v: 选取最近的 2% 处作为黑色/蓝色起点 (过滤掉极近的噪点)
+                # max_v: 选取 80% 处作为红色终点 (剩下的 20% 通常是天空，强制设为红色)
+                if flat_depth.numel() > 0:
+                    min_v = torch.quantile(depth, 0.02)
+                    max_v = torch.quantile(depth, 0.80) 
+                else:
+                    min_v = torch.tensor(0.0).cuda()
+                    max_v = torch.tensor(1.0).cuda()
+                
+                # 4. 动态截断与归一化
+                # 限制范围
+                depth_clamped = torch.clamp(depth, min=min_v, max=max_v)
+                
+                # 归一化到 0-1
+                if max_v - min_v > 1e-6:
+                    depth_norm = (depth_clamped - min_v) / (max_v - min_v)
+                else:
+                    depth_norm = torch.zeros_like(depth)
+
+                # 5. 转 Numpy 及伪彩色
+                depth_np_1ch = depth_norm.detach().squeeze().cpu().numpy()
+                depth_uint8 = (depth_np_1ch * 255).astype(np.uint8)
+                depth_colormap = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_JET)
+
+                # 6. 转回 RGB 并发送
+                img_np = cv2.cvtColor(depth_colormap, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                # ========================== 替换结束 ==========================
+                
+                # 2. 转换为 Numpy 格式 [H, W]
+                depth_np_1ch = depth_norm.detach().squeeze().cpu().numpy()
+                
+                # 3. 应用伪彩色 (Colormap) 让深度更直观
+                # 转换到 0-255 uint8
+                depth_uint8 = (depth_np_1ch * 255).astype(np.uint8)
+                # 使用 JET 或 TURBO 配色方案 (近处蓝/冷，远处红/热)
+                # applyColorMap 返回的是 BGR 格式 [H, W, 3]
+                depth_colormap = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_JET)
+
+                # 4. 适配原有的发送逻辑
+                # 原有的 socket 线程期待的是 RGB 格式且范围在 0.0-1.0 的 float 数组
+                # 所以我们将 BGR 转回 RGB，并归一化
+                img_np = cv2.cvtColor(depth_colormap, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                
+                # (原有的 RGB 代码已被上述代码替代)
+                # rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                # img_np = rendering.detach().permute(1, 2, 0).cpu().numpy()
+                # ========================== 修改结束 ==========================
                 
                 try:
                     img_queue.put_nowait(img_np)

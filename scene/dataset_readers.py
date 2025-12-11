@@ -153,10 +153,108 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
+# def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, masks_folder, depths_folder, add_aerial, add_street):
+#     cam_infos = []
+    
+#     def process_frame(idx, key):
+#         extr = cam_extrinsics[key]
+#         intr = cam_intrinsics[extr.camera_id]
+#         height = intr.height
+#         width = intr.width
+
+#         uid = intr.id
+#         R = np.transpose(qvec2rotmat(extr.qvec))
+#         T = np.array(extr.tvec)
+
+#         if intr.model=="SIMPLE_PINHOLE" or intr.model == "SIMPLE_RADIAL":
+#             focal_length_x = intr.params[0]
+#             CX, CY = intr.params[1], intr.params[2]
+#             FovY = focal2fov(focal_length_x, height)
+#             FovX = focal2fov(focal_length_x, width)
+#         elif intr.model=="PINHOLE":
+#             focal_length_x = intr.params[0]
+#             focal_length_y = intr.params[1]
+#             CX, CY = intr.params[2], intr.params[3]
+#             FovY = focal2fov(focal_length_y, height)
+#             FovX = focal2fov(focal_length_x, width)
+#         else:
+#             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+        
+#         image_path = os.path.join(images_folder, extr.name)
+#         if not os.path.exists(image_path):
+#             return None
+#         image_name = os.path.basename(image_path).split(".")[0]
+#         image = Image.open(image_path)
+
+#         depth_params = None
+#         if depths_params is not None:
+#             try:
+#                 depth_params = depths_params[extr.name.split(".")[0]]
+#             except:
+#                 print("\n", key, "not found in depths_params")
+#         if masks_folder is not None:
+#             mask_path = os.path.join(masks_folder, extr.name)
+#             mask = Image.open(mask_path)
+#         else:
+#             mask = None
+#         if depths_folder is not None:
+#             depth_path = os.path.join(depths_folder, extr.name.replace(".JPG", ".png")) 
+#             depth = cv2.imread(depth_path, -1).astype(np.float32) / float(2**16)
+#         else:
+#             depth = None
+
+#         return CameraInfo(
+#             uid=uid, 
+#             R=R, 
+#             T=T, 
+#             FovY=FovY,
+#             FovX=FovX, 
+#             CX=CX,
+#             CY=CY,
+#             image=image,
+#             mask=mask,
+#             depth=depth,
+#             depth_params=depth_params,
+#             image_path=image_path, 
+#             image_name=image_name, 
+#             width=width, 
+#             height=height
+#         )
+
+#     ct = 0
+#     progress_bar = tqdm(cam_extrinsics, desc="Loading dataset")
+
+#     with concurrent.futures.ThreadPoolExecutor() as executor:
+#         futures = [executor.submit(process_frame, idx, key) for idx, key in enumerate(cam_extrinsics)]
+
+#         for future in concurrent.futures.as_completed(futures):
+#             cam_info = future.result()
+#             if cam_info is None:
+#                 continue
+#             if "aerial" in cam_info.image_path:
+#                 if add_aerial:
+#                     cam_infos.append(cam_info)
+#             elif "street" in cam_info.image_path: 
+#                 if add_street:
+#                     cam_infos.append(cam_info)
+#             else:
+#                 cam_infos.append(cam_info)
+            
+#             ct+=1
+#             if ct % 10 == 0:
+#                 progress_bar.set_postfix({"num": Fore.YELLOW+f"{ct}/{len(cam_extrinsics)}"+Style.RESET_ALL})
+#                 progress_bar.update(10)
+
+#         progress_bar.close()
+
+#     cam_infos = sorted(cam_infos, key = lambda x : x.image_path)
+#     return cam_infos
+
 def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, masks_folder, depths_folder, add_aerial, add_street):
     cam_infos = []
     
     def process_frame(idx, key):
+        # key 就是 COLMAP 的 Image ID (Integer)
         extr = cam_extrinsics[key]
         intr = cam_intrinsics[extr.camera_id]
         height = intr.height
@@ -186,22 +284,66 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
+        # ================= [FIX START] 鲁棒的参数查找 =================
         depth_params = None
         if depths_params is not None:
-            try:
-                depth_params = depths_params[extr.name.split(".")[0]]
-            except:
-                print("\n", key, "not found in depths_params")
+            # 构造所有可能的 Key，挨个试
+            keys_to_try = [
+                key,                        # 1. 整数 ID (最推荐)
+                str(key),                   # 2. 字符串 ID
+                extr.name,                  # 3. 相对路径 (aerial/001.png)
+                os.path.basename(extr.name),# 4. 文件名 (001.png)
+                extr.name.split(".")[0]     # 5. 旧逻辑 (aerial/001)
+            ]
+            
+            for k in keys_to_try:
+                if k in depths_params:
+                    depth_params = depths_params[k]
+                    break
+            
+            # 如果试了一圈还是没找到，打印详细报错
+            if depth_params is None:
+                # 为了防止多线程打印混乱，这里简单 print，或者你可以用 tqdm.write
+                print(f"\n[WARN] ID {key} ({extr.name}) not found in depths_params!")
+        # ================= [FIX END] =================
+
         if masks_folder is not None:
             mask_path = os.path.join(masks_folder, extr.name)
-            mask = Image.open(mask_path)
+            if os.path.exists(mask_path):
+                mask = Image.open(mask_path)
+            else:
+                mask = None
         else:
             mask = None
+
+        # ================= [FIX START] 鲁棒的深度图路径查找 =================
+        depth = None
         if depths_folder is not None:
-            depth_path = os.path.join(depths_folder, extr.name.replace(".JPG", ".png")) 
-            depth = cv2.imread(depth_path, -1).astype(np.float32) / float(2**16)
-        else:
-            depth = None
+            # 尝试多种深度图命名/路径格式
+            # 1. 直接替换后缀 (最常见)
+            p1 = os.path.join(depths_folder, extr.name.replace(".JPG", ".png").replace(".jpg", ".png"))
+            # 2. 也是替换后缀为 .npy
+            p2 = os.path.join(depths_folder, extr.name.replace(".JPG", ".npy").replace(".jpg", ".npy"))
+            # 3. 只有文件名 (不带 aerial/street 目录)
+            p3 = os.path.join(depths_folder, os.path.basename(extr.name).replace(".JPG", ".png").replace(".jpg", ".png"))
+            p4 = os.path.join(depths_folder, os.path.basename(extr.name).replace(".JPG", ".npy").replace(".jpg", ".npy"))
+
+            candidate_paths = [p1, p2, p3, p4]
+            
+            for d_path in candidate_paths:
+                if os.path.exists(d_path):
+                    if d_path.endswith(".npy"):
+                        depth = np.load(d_path)
+                    else:
+                        # 假设 png 存的是 16bit 深度，需要除以 65535 或者 1000 (视具体数据而定)
+                        # HorizonGS 默认行为是 / 2**16
+                        depth = cv2.imread(d_path, -1)
+                        if depth is not None:
+                            depth = depth.astype(np.float32) / float(2**16)
+                    
+                    if depth is not None:
+                        break # 找到了就退出循环
+        # ================= [FIX END] =================
 
         return CameraInfo(
             uid=uid, 
@@ -222,6 +364,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         )
 
     ct = 0
+    # 注意：这里把 cam_extrinsics 转为 list 可能会更稳定，因为它是 dict
     progress_bar = tqdm(cam_extrinsics, desc="Loading dataset")
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -231,18 +374,23 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
             cam_info = future.result()
             if cam_info is None:
                 continue
-            if "aerial" in cam_info.image_path:
+            
+            # 这里的路径判断也建议加个 lower() 增加鲁棒性
+            path_lower = cam_info.image_path.lower()
+            
+            if "aerial" in path_lower:
                 if add_aerial:
                     cam_infos.append(cam_info)
-            elif "street" in cam_info.image_path: 
+            elif "street" in path_lower: 
                 if add_street:
                     cam_infos.append(cam_info)
             else:
+                # 默认行为
                 cam_infos.append(cam_info)
             
             ct+=1
             if ct % 10 == 0:
-                progress_bar.set_postfix({"num": Fore.YELLOW+f"{ct}/{len(cam_extrinsics)}"+Style.RESET_ALL})
+                progress_bar.set_postfix({"num": f"{ct}/{len(cam_extrinsics)}"})
                 progress_bar.update(10)
 
         progress_bar.close()
@@ -481,15 +629,61 @@ def readColmapSceneInfo(path, eval, images, add_mask, add_depth, add_aerial, add
     depths_params = None
     if add_depth:
         try:
+            print(f"[LOADER] Loading depth params from {depth_params_file}")
             with open(depth_params_file, "r") as f:
-                depths_params = json.load(f)
-            all_scales = np.array([depths_params[key]["scale"] for key in depths_params])
+                raw_params = json.load(f)
+            
+            # === [FIX START] 全覆盖填充策略 ===
+            depths_params = {}
+            
+            # 1. 建立基础索引: String ID -> Params
+            # raw_params 的 key 是 String ID ("1", "2"...)
+            
+            # 2. 利用 cam_extrinsics 建立映射表
+            # 我们需要把 ID, Name, Basename 全部指向同一个参数对象
+            for img_id, img_info in cam_extrinsics.items():
+                # img_id 是整数 (e.g., 1)
+                # img_info.name 是文件名 (e.g., "aerial/aerial_0001.png")
+                
+                str_id = str(img_id)
+                
+                # 尝试从原始 JSON 中获取参数
+                if str_id in raw_params:
+                    param_val = raw_params[str_id]
+                elif img_id in raw_params: # 虽然不太可能，但也检查下整数
+                    param_val = raw_params[img_id]
+                else:
+                    # 如果找不到，说明 JSON 里缺数据
+                    # print(f"Warning: ID {img_id} not found in json")
+                    continue
+                
+                # 填充所有可能的键
+                depths_params[img_id] = param_val           # Key: 1 (Int)
+                depths_params[str_id] = param_val           # Key: "1" (Str)
+                depths_params[img_info.name] = param_val    # Key: "aerial/aerial_0001.png"
+                
+                # 甚至加上纯文件名 (不带路径)
+                basename = os.path.basename(img_info.name)
+                depths_params[basename] = param_val         # Key: "aerial_0001.png"
+                
+                # 甚至加上无后缀名
+                name_no_ext = os.path.splitext(basename)[0]
+                depths_params[name_no_ext] = param_val      # Key: "aerial_0001"
+
+            print(f"[LOADER] Depth params populated with {len(depths_params)} keys (Multi-index).")
+            # === [FIX END] ===
+
+            # 计算中位数 Scale
+            # 注意：raw_params 里的才是原始独立数据，计算中位数用它
+            all_scales = np.array([v["scale"] for v in raw_params.values()])
             if (all_scales > 0).sum():
                 med_scale = np.median(all_scales[all_scales > 0])
             else:
                 med_scale = 0
-            for key in depths_params:
-                depths_params[key]["med_scale"] = med_scale
+            
+            # 更新到所有条目 (因为是引用，改一个即可同步)
+            for key in raw_params:
+                raw_params[key]["med_scale"] = med_scale
 
         except FileNotFoundError:
             print(f"Error: depth_params.json file not found at path '{depth_params_file}'.")
@@ -501,8 +695,42 @@ def readColmapSceneInfo(path, eval, images, add_mask, add_depth, add_aerial, add
     reading_dir = os.path.join(path, images)
     mask_dir = os.path.join(path, "masks") if add_mask else None
     depth_dir = os.path.join(path, "depths") if add_depth else None
-    cam_infos = readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, reading_dir, mask_dir, depth_dir, add_aerial, add_street)
+
+    # ================= [DEBUG START] 案发现场取证 =================
+    print("\n" + "="*20 + " INTERNAL DEBUG " + "="*20)
     
+    # 1. 检查传进去的 depths_params 到底有些什么 Key
+    if depths_params is not None:
+        dp_keys = list(depths_params.keys())
+        print(f"[DEBUG] depths_params 长度: {len(dp_keys)}")
+        print(f"[DEBUG] depths_params 前5个 Key: {dp_keys[:5]}")
+        print(f"[DEBUG] depths_params Key 类型: {type(dp_keys[0])}")
+        
+        # 2. 针对性测试：是否存在整数 1 和字符串 '1'
+        print(f"[DEBUG] 整数 1 在 depths_params 吗? -> {1 in depths_params}")
+        print(f"[DEBUG] 字符串 '1' 在 depths_params 吗? -> {'1' in depths_params}")
+    else:
+        print("[DEBUG] depths_params is None!")
+
+    # 3. 检查 cam_extrinsics (这是 readColmapCameras 用来遍历的源头)
+    ce_keys = list(cam_extrinsics.keys())
+    print(f"[DEBUG] cam_extrinsics 长度: {len(ce_keys)}")
+    print(f"[DEBUG] cam_extrinsics 前5个 Key: {ce_keys[:5]}")
+    print(f"[DEBUG] cam_extrinsics Key 类型: {type(ce_keys[0])}")
+    
+    # 4. 模拟 readColmapCameras 的查找过程
+    test_id = ce_keys[0] # 拿第一个相机ID做测试
+    print(f"[DEBUG] 模拟查找 ID: {test_id} (Type: {type(test_id)})")
+    if depths_params is not None:
+        if test_id in depths_params:
+            print(f"[DEBUG] -> 查找成功! Value: {depths_params[test_id]}")
+        else:
+            print(f"[DEBUG] -> 查找失败! (这就是报错的原因)")
+    
+    print("="*56 + "\n")
+    # ================= [DEBUG END] =================
+
+    cam_infos = readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, reading_dir, mask_dir, depth_dir, add_aerial, add_street)  
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
         test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
@@ -532,6 +760,74 @@ def readColmapSceneInfo(path, eval, images, add_mask, add_depth, add_aerial, add
                            nerf_normalization=nerf_normalization,
                            ply_path=ply_path)
     return scene_info
+
+# def readColmapSceneInfo(path, eval, images, add_mask, add_depth, add_aerial, add_street, llffhold=32):
+#     try:
+#         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
+#         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+#         cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
+#         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
+#     except:
+#         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
+#         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
+#         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
+#         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+
+#     depth_params_file = os.path.join(path, "sparse/0", "depth_params.json")
+#     depths_params = None
+#     if add_depth:
+#         try:
+#             with open(depth_params_file, "r") as f:
+#                 depths_params = json.load(f)
+#             all_scales = np.array([depths_params[key]["scale"] for key in depths_params])
+#             if (all_scales > 0).sum():
+#                 med_scale = np.median(all_scales[all_scales > 0])
+#             else:
+#                 med_scale = 0
+#             for key in depths_params:
+#                 depths_params[key]["med_scale"] = med_scale
+
+#         except FileNotFoundError:
+#             print(f"Error: depth_params.json file not found at path '{depth_params_file}'.")
+#             sys.exit(1)
+#         except Exception as e:
+#             print(f"An unexpected error occurred when trying to open depth_params.json file: {e}")
+#             sys.exit(1)
+
+#     reading_dir = os.path.join(path, images)
+#     mask_dir = os.path.join(path, "masks") if add_mask else None
+#     depth_dir = os.path.join(path, "depths") if add_depth else None
+#     cam_infos = readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, reading_dir, mask_dir, depth_dir, add_aerial, add_street)
+    
+#     if eval:
+#         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+#         test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+#     else:
+#         train_cam_infos = cam_infos
+#         test_cam_infos = []
+
+#     nerf_normalization = getNerfppNorm(train_cam_infos)
+
+#     ply_path = os.path.join(path, "sparse/0/points3D.ply")
+#     bin_path = os.path.join(path, "sparse/0/points3D.bin")
+#     txt_path = os.path.join(path, "sparse/0/points3D.txt")
+#     if not os.path.exists(ply_path):
+#         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+#         try:
+#             xyz, rgb, _ = read_points3D_binary(bin_path)
+#         except:
+#             xyz, rgb, _ = read_points3D_text(txt_path)
+#         storePly(ply_path, xyz, rgb)
+#     # try:
+#     print(f'start fetching data from ply file')
+#     pcd = fetchPly(ply_path)
+
+#     scene_info = SceneInfo(point_cloud=pcd,
+#                            train_cameras=train_cam_infos,
+#                            test_cameras=test_cam_infos,
+#                            nerf_normalization=nerf_normalization,
+#                            ply_path=ply_path)
+#     return scene_info
 
 def readNerfSyntheticInfo(path, eval, add_mask, add_depth, add_aerial, add_street, center, scale):
     print("Reading Training Transforms")
