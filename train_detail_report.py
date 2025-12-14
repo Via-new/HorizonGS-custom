@@ -14,7 +14,6 @@ import shutil
 import numpy as np
 import json
 import struct
-import types # 用于 Monkey Patch
 
 import subprocess
 # 构建命令查询 nvidia-smi 的显存信息
@@ -39,7 +38,7 @@ from pathlib import Path
 from PIL import Image
 import torchvision.transforms.functional as tf
 import lpips
-from random import randint, random
+from random import randint
 from utils.loss_utils import l1_loss, ssim
 import sys
 from gaussian_renderer import network_gui
@@ -66,165 +65,6 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
     print("not found tf board")
-
-# ================= [OVERLAP OPTIMIZATION CLASSES START] =================
-
-class FrustumCuller:
-    """
-    负责计算 3D 锚点与相机视锥体的几何关系。
-    """
-    @staticmethod
-    def filter_anchors_by_frustum(anchors, view_proj_matrix, margin=0.0):
-        """
-        计算哪些锚点位于相机的视锥体内。
-        anchors: [N, 3] tensor
-        view_proj_matrix: [4, 4] tensor (World -> Clip)
-        """
-        # 齐次坐标变换 把视椎体变成立方体
-        p_hom = torch.cat([anchors, torch.ones_like(anchors[:, :1])], dim=1) # [N, 4]
-        p_clip = p_hom @ view_proj_matrix.transpose(0, 1) # [N, 4]
-        
-        # 转换到 NDC (透视除法)
-        # 加上一个小 epsilon 避免除零
-        p_ndc = p_clip[:, :3] / (p_clip[:, 3:4] + 1e-6)
-        
-        # 检查边界 [-1, 1] 判断锚点是否在这个立方体中
-        # margin 用于稍微放宽视锥体，防止边缘的物体被生硬切断导致伪影
-        limit = 1.0 + margin
-        mask_x = (p_ndc[:, 0] > -limit) & (p_ndc[:, 0] < limit)
-        mask_y = (p_ndc[:, 1] > -limit) & (p_ndc[:, 1] < limit)
-        mask_z = (p_clip[:, 2] > 0.0) # Near plane check (在裁剪空间 z > 0)
-
-        return mask_x & mask_y & mask_z
-
-class OverlapManager:
-    """
-    管理相机的重叠关系图，用于采样成对数据。
-    """
-    def __init__(self, scene, logger, sample_rate=10):
-        self.scene = scene
-        self.logger = logger
-        self.sample_rate = sample_rate # 为了速度，只对部分锚点做预计算
-        self.overlap_graph = {} # Key: Street Cam Index, Value: List of (Aerial Cam Index, IoU)
-        self.street_cams = [c for c in scene.getTrainCameras() if c.image_type == 'street']
-        self.aerial_cams = [c for c in scene.getTrainCameras() if c.image_type == 'aerial']
-        self.is_initialized = False
-
-    def build_graph(self, gaussians):
-        """
-        预计算所有街景相机和航拍相机的重叠度 (IoU based on Visible Anchors)。
-        """
-        if self.is_initialized:
-            return
-        
-        if len(self.street_cams) == 0 or len(self.aerial_cams) == 0:
-            self.logger.warning("[OverlapManager] Cannot build graph: Missing either street or aerial cameras.")
-            return
-
-        self.logger.info(f"\n[OverlapManager] === Starting to build Cross-View Overlap Graph ===")
-        self.logger.info(f"[OverlapManager] Street Cams: {len(self.street_cams)}, Aerial Cams: {len(self.aerial_cams)}")
-        
-        # 使用当前所有锚点的一个子集来近似
-        anchors = gaussians.get_anchor.detach()[::self.sample_rate]
-        num_anchors = anchors.shape[0]
-        self.logger.info(f"[OverlapManager] Using {num_anchors} anchors (Sample Rate: 1/{self.sample_rate}) for calculation.")
-        
-        if num_anchors == 0:
-            self.logger.error("[OverlapManager] ERROR: No anchors found! Skipping graph build.")
-            return
-
-        t0 = time.time()
-
-        # 1. 计算每个街景相机的可见锚点掩膜
-        street_masks = []
-        for cam in self.street_cams:
-            mask = FrustumCuller.filter_anchors_by_frustum(anchors, cam.full_proj_transform)
-            street_masks.append(mask) # Bool Tensor [N_sub]
-            
-        # 2. 计算每个航拍相机的可见锚点掩膜
-        aerial_masks = []
-        for cam in self.aerial_cams:
-            mask = FrustumCuller.filter_anchors_by_frustum(anchors, cam.full_proj_transform)
-            aerial_masks.append(mask)
-
-        # 3. 计算 IoU 矩阵
-        S_mat = torch.stack(street_masks).float() # [S, N]
-        A_mat = torch.stack(aerial_masks).float() # [A, N]
-        
-        # Intersection: S_mat @ A_mat.T
-        intersection = S_mat @ A_mat.T # [S, A]
-        
-        # Union: S_sum + A_sum - Intersection
-        s_sum = S_mat.sum(dim=1, keepdim=True) # [S, 1]
-        a_sum = A_mat.sum(dim=1, keepdim=True).T # [1, A]
-        union = s_sum + a_sum - intersection
-        
-        iou_matrix = intersection / (union + 1e-6)
-        
-        valid_overlaps_count = 0
-        # 构建图
-        for i, s_cam in enumerate(self.street_cams):
-            # 找到 IoU 最高的 K 个航拍图
-            scores = iou_matrix[i]
-            # 过滤掉 IoU 极低的
-            valid_indices = torch.nonzero(scores > 0.01).squeeze()
-            if valid_indices.numel() > 0:
-                valid_overlaps_count += 1
-                if valid_indices.numel() == 1:
-                    valid_indices = valid_indices.unsqueeze(0)
-                
-                best_matches = []
-                for idx in valid_indices:
-                    best_matches.append((self.aerial_cams[idx.item()], scores[idx].item()))
-                
-                # 按 IoU 降序排列
-                best_matches.sort(key=lambda x: x[1], reverse=True)
-                self.overlap_graph[s_cam.colmap_id] = best_matches
-            else:
-                self.overlap_graph[s_cam.colmap_id] = []
-        
-        t1 = time.time()
-        self.is_initialized = True
-        self.logger.info(f"[OverlapManager] Graph built in {t1-t0:.2f}s.")
-        self.logger.info(f"[OverlapManager] Result: {valid_overlaps_count}/{len(self.street_cams)} street cameras have valid overlaps (>0.01 IoU).")
-        
-        # 打印一些示例，方便 Debug
-        example_count = 0
-        for s_id, matches in self.overlap_graph.items():
-            if len(matches) > 0 and example_count < 3:
-                s_cam = next((c for c in self.street_cams if c.colmap_id == s_id), None)
-                top_match = matches[0]
-                self.logger.info(f"[OverlapManager] [Example] Street '{s_cam.image_name}' <-> Aerial '{top_match[0].image_name}' (IoU: {top_match[1]:.4f})")
-                example_count += 1
-        
-        self.logger.info(f"[OverlapManager] === Graph Build Complete ===\n")
-
-    def get_paired_batch(self):
-        """
-        随机采样一个街景相机，并根据重叠图采样一个对应的航拍相机。
-        返回: (cam_street, cam_aerial)
-        """
-        if not self.is_initialized:
-            return None, None
-            
-        # 1. 随机选一个有重叠关系的街景相机
-        valid_street_keys = [k for k, v in self.overlap_graph.items() if len(v) > 0]
-        if not valid_street_keys:
-            return None, None
-            
-        # 这里的 key 是 colmap_id，需要找回对象
-        s_id = valid_street_keys[randint(0, len(valid_street_keys)-1)]
-        s_cam = next((c for c in self.street_cams if c.colmap_id == s_id), None)
-        
-        matches = self.overlap_graph[s_id]
-        # 2. 从匹配列表中选择，倾向于 IoU 高的，但也保留随机性（Top-5）
-        k = min(len(matches), 5)
-        selected_match = matches[randint(0, k-1)]
-        a_cam = selected_match[0]
-        
-        return s_cam, a_cam
-
-# ================= [OVERLAP OPTIMIZATION CLASSES END] =================
 
 def saveRuntimeCode(dst: str) -> None:
     """
@@ -297,11 +137,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     gaussians = getattr(modules, model_config['name'])(**model_config['kwargs'])
     
     # ================= [DIAGNOSIS LOGIC START] =================
+    # 为了避免刷屏，这里的诊断信息只在初始化时运行一次
     logger.info("\n" + "="*20 + " 深度参数与COLMAP一致性检查 " + "="*20)
     json_path = os.path.join(dataset.source_path, "sparse", "0", "depth_params.json")
     
     if os.path.exists(json_path):
         logger.info(f"[JSON] 发现文件: {json_path}")
+        # 简单检查一下文件是否能读取
         try:
             with open(json_path, 'r') as f:
                 json.load(f)
@@ -321,12 +163,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     aerial_count = 0
     street_count = 0
     
+    # [NEW] 统计 Depth 和 Mask 的加载情况
     depth_loaded_count = 0
     mask_loaded_count = 0
     total_train_cams = len(scene.getTrainCameras())
 
     for cam in scene.getTrainCameras():
+        # 获取小写文件名
         img_name = cam.image_name.lower()
+        
         if "street" in img_name:
             cam.image_type = "street"
             street_count += 1
@@ -337,20 +182,35 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             cam.image_type = "aerial"
             aerial_count += 1
         
+        # [NEW] 检查 Depth (invdepthmap 存在即表示读取成功)
         if cam.invdepthmap is not None:
             depth_loaded_count += 1
+            
+        # [NEW] 检查 Mask (alpha_mask 存在即表示读取成功)
         if cam.alpha_mask is not None:
             mask_loaded_count += 1
             
     logger.info(f"Manual Classification Result: Aerial={aerial_count}, Street={street_count}")
     
+    # [NEW] 打印 Depth 和 Mask 的统计信息 (只打印一次)
     logger.info("-" * 50)
     logger.info(f"数据加载完整性检查 (训练集):")
     logger.info(f"  总相机数 (Total Cameras) : {total_train_cams}")
     logger.info(f"  深度图 (Depth Maps)      : {depth_loaded_count} / {total_train_cams} ({(depth_loaded_count/total_train_cams)*100:.1f}%)")
     logger.info(f"  掩码图 (Masks)           : {mask_loaded_count} / {total_train_cams} ({(mask_loaded_count/total_train_cams)*100:.1f}%)")
+    
+    if dataset.add_depth and depth_loaded_count < total_train_cams:
+        logger.warning(f"警告: 已开启 add_depth，但有 {total_train_cams - depth_loaded_count} 张图片未加载到深度图！")
+    elif dataset.add_depth:
+        logger.info("成功: 所有相机的深度图已成功加载。")
+
+    if dataset.add_mask and mask_loaded_count < total_train_cams:
+        logger.warning(f"警告: 已开启 add_mask，但有 {total_train_cams - mask_loaded_count} 张图片未加载到掩码！")
+    elif dataset.add_mask:
+        logger.info("成功: 所有相机的掩码已成功加载。")
     logger.info("-" * 50)
 
+    # 安全检查
     if street_count == 0 and pipe.camera_balance:
         logger.warning("WARNING: No street cameras found even after manual fix! Disabling camera_balance.")
         pipe.camera_balance = False
@@ -359,46 +219,36 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     scene.add_street = (street_count > 0)
     # ================= [修复结束] =================
 
-    # [NEW] 初始化重叠管理器
-    overlap_manager = OverlapManager(scene, logger)
-    # 只有在存在两个视角时才构建图
-    if scene.add_aerial and scene.add_street:
-        overlap_manager.build_graph(gaussians)
-
     # 设置 Gaussian 模型的训练参数 (优化器等)
     gaussians.training_setup(opt)
     
+    # 如果有 checkpoint，加载模型参数并恢复训练状态
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
+    # 设置 CUDA 事件用于计时
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
     
+    # 获取深度 L1 损失权重的指数衰减函数
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    # 简单的 viewstack 用于非重叠训练
-    viewpoint_stack = None
-    aerial_viewpoint_stack = None
-    street_viewpoint_stack = None
+    if pipe.camera_balance:
+        aerial_viewpoint_stack = None
+        street_viewpoint_stack = None
+    else:
+        viewpoint_stack = None
         
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
     densify_cnt = 0
     
+    # [NEW] 优化进度条设置：leave=True(保留进度条), dynamic_ncols=True(自适应宽度), mininterval=0.5(减少刷新频率)
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress", leave=True, dynamic_ncols=True, mininterval=0.5)
     first_iter += 1
     modules = __import__('gaussian_renderer')
     
-    # ------------------------------------------------------------------------------------------------
-    # 定义 Monkey Patch 函数，用于在重叠优化期间临时禁用 set_anchor_mask
-    # ------------------------------------------------------------------------------------------------
-    def dummy_set_anchor_mask(self, cam_center, resolution_scale):
-        pass # Do nothing, trust the mask set manually
-    
-    original_set_anchor_mask = gaussians.set_anchor_mask
-    # ------------------------------------------------------------------------------------------------
-
     # --- 开始训练循环 ---
     for iteration in range(first_iter, opt.iterations + 1):        
         if network_gui.conn == None:
@@ -418,204 +268,152 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         iter_start.record()
 
+        # 更新学习率
         gaussians.update_learning_rate(iteration)
         
-        # [NEW] 决策：是否进行重叠优化？
-        # 策略：80% 概率进行重叠优化（如果有足够的数据），20% 概率进行全局随机采样（防止背景遗忘）
-        # 且仅在训练后期（比如 iteration > 1000）启用，以保证 Coarse Stage 的稳定性（如果适用）
-        do_overlap_opt = (random() < 0.8) and overlap_manager.is_initialized and (iteration > 500)
+        # --- 选择一个随机相机进行训练 ---
+        if pipe.camera_balance:
+            if not aerial_viewpoint_stack:
+                aerial_viewpoint_stack = [cam for cam in scene.getTrainCameras().copy() if cam.image_type == "aerial"]
+            if not street_viewpoint_stack:
+                street_viewpoint_stack = [cam for cam in scene.getTrainCameras().copy() if cam.image_type == "street"]
+            
+            aerial_proportion, street_proportion = pipe.camera_proportion.split("-")
+            r = float(aerial_proportion) / ( float(aerial_proportion) + float(street_proportion) )
+            if np.random.rand() < r:
+                viewpoint_cam = aerial_viewpoint_stack.pop(randint(0, len(aerial_viewpoint_stack)-1))
+            else:
+                viewpoint_cam = street_viewpoint_stack.pop(randint(0, len(street_viewpoint_stack)-1))
+        else:
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+        # --- 前向传播：渲染 ---
+        render_pkg = getattr(modules, 'render')(viewpoint_cam, gaussians, pipe, scene.background)
+        image, scaling, alpha = render_pkg["render"], render_pkg["scaling"], render_pkg["render_alphas"]
+
+        gt_image = viewpoint_cam.original_image.cuda()
+        alpha_mask = viewpoint_cam.alpha_mask.cuda()
         
-        viewpoint_cams = []
-        is_overlap_step = False
-
-        if do_overlap_opt:
-            cam_s, cam_a = overlap_manager.get_paired_batch()
-            if cam_s is not None and cam_a is not None:
-                viewpoint_cams = [cam_s, cam_a]
-                is_overlap_step = True
+        # 应用掩码
+        image = image * alpha_mask
+        gt_image = gt_image * alpha_mask
+            
+        # --- 计算基础损失 ---
+        Ll1 = l1_loss(image, gt_image)
+        ssim_loss = (1.0 - ssim(image, gt_image))
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
+       
+        # --- 计算正则化损失 ---
+        if opt.lambda_dreg > 0:
+            if scaling.shape[0] > 0:
+                scaling_reg = scaling.prod(dim=1).mean()
             else:
-                # 回退到普通模式
-                do_overlap_opt = False
-
-        if not do_overlap_opt:
-            # --- 标准逻辑：选择一个随机相机 ---
-            if pipe.camera_balance:
-                if not aerial_viewpoint_stack:
-                    aerial_viewpoint_stack = [cam for cam in scene.getTrainCameras().copy() if cam.image_type == "aerial"]
-                if not street_viewpoint_stack:
-                    street_viewpoint_stack = [cam for cam in scene.getTrainCameras().copy() if cam.image_type == "street"]
-                
-                aerial_proportion, street_proportion = pipe.camera_proportion.split("-")
-                r = float(aerial_proportion) / ( float(aerial_proportion) + float(street_proportion) )
-                if np.random.rand() < r:
-                    viewpoint_cams = [aerial_viewpoint_stack.pop(randint(0, len(aerial_viewpoint_stack)-1))]
-                else:
-                    viewpoint_cams = [street_viewpoint_stack.pop(randint(0, len(street_viewpoint_stack)-1))]
-            else:
-                if not viewpoint_stack:
-                    viewpoint_stack = scene.getTrainCameras().copy()
-                viewpoint_cams = [viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))]
-
-        # --- 准备 Loss 变量 ---
-        total_loss = 0
-        total_Ll1depth = 0
+                scaling_reg = torch.tensor(0.0, device="cuda")
+            loss += opt.lambda_dreg * scaling_reg
         
-        # [NEW] 如果是重叠优化，我们需要计算交集 Mask 并应用 Monkey Patch
-        if is_overlap_step:
-            # 1. 计算 3D 空间重叠 Mask
-            anchors = gaussians.get_anchor.detach()
-            mask_s = FrustumCuller.filter_anchors_by_frustum(anchors, viewpoint_cams[0].full_proj_transform, margin=0.1)
-            mask_a = FrustumCuller.filter_anchors_by_frustum(anchors, viewpoint_cams[1].full_proj_transform, margin=0.1)
-            overlap_mask = mask_s & mask_a
-            
-            # [LOGGING] 打印 Mask 统计信息
-            num_overlap = overlap_mask.sum().item()
-            total_anchors = overlap_mask.numel()
-            ratio = num_overlap / total_anchors
-            
-            # 每100步打印一次详细信息，或者如果点数过少报警
-            if iteration % 2000 == 0 or num_overlap < 100:
-                logger.info(f"\n[ITER {iteration}] [OVERLAP OPT] Active Anchors: {num_overlap}/{total_anchors} ({ratio:.4%})")
-                logger.info(f"[ITER {iteration}] [OVERLAP OPT] Pair: Street '{viewpoint_cams[0].image_name}' <-> Aerial '{viewpoint_cams[1].image_name}'")
-                if num_overlap < 100:
-                    logger.warning(f"[ITER {iteration}] [OVERLAP OPT] WARNING: Extremely low overlap detected! Check frustum logic or camera poses.")
+        if opt.lambda_sky_opa > 0:
+            o = alpha.clamp(1e-6, 1-1e-6)
+            sky = alpha_mask.float()
+            loss_sky_opa = (-(1-sky) * torch.log(1 - o)).mean()
+            loss = loss + opt.lambda_sky_opa * loss_sky_opa
 
-            # 2. 备份并替换 Mask
-            original_anchor_mask = gaussians._anchor_mask
-            gaussians._anchor_mask = overlap_mask
-            
-            # 3. Monkey Patch disable set_anchor_mask
-            # 这里的目的是防止 render() 函数内部调用 set_anchor_mask 重置了我们辛苦计算的 overlap_mask
-            gaussians.set_anchor_mask = types.MethodType(dummy_set_anchor_mask, gaussians)
+        if opt.lambda_opacity_entropy > 0:
+            o = alpha.clamp(1e-6, 1 - 1e-6)
+            loss_opacity_entropy = -(o*torch.log(o)).mean()
+            loss = loss + opt.lambda_opacity_entropy * loss_opacity_entropy
 
-        # --- 遍历该 Batch 的相机进行渲染 (Batch Size 可能是 1 或 2) ---
-        for viewpoint_cam in viewpoint_cams:
-            render_pkg = getattr(modules, 'render')(viewpoint_cam, gaussians, pipe, scene.background)
-            image, scaling, alpha = render_pkg["render"], render_pkg["scaling"], render_pkg["render_alphas"]
+        if opt.lambda_normal > 0 and iteration > opt.normal_start_iter:
+            assert gaussians.render_mode=="RGB+ED" or gaussians.render_mode=="RGB+D"
+            normals = render_pkg["render_normals"].squeeze(0).permute((2, 0, 1))
+            normals_from_depth = render_pkg["render_normals_from_depth"] * render_pkg["render_alphas"].permute((1, 2, 0)).detach()
+            if len(normals_from_depth.shape) == 4:
+                normals_from_depth = normals_from_depth.squeeze(0)
+            normals_from_depth = normals_from_depth.permute((2, 0, 1))
+            normal_error = (1 - (normals * normals_from_depth).sum(dim=0))[None]
+            loss += opt.lambda_normal * (normal_error * alpha_mask).mean()
 
-            gt_image = viewpoint_cam.original_image.cuda()
-            alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            
-            # 在重叠优化模式下，渲染出来的图像只有重叠部分有内容，背景是空的。
-            # 我们必须用 alpha 来动态 Mask Loss，否则会迫使重叠部分去拟合全黑背景（如果 background=0）
-            # 或者拟合背景颜色。
-            if is_overlap_step:
-                # 动态 Mask: 只在有高斯渲染的地方计算 Loss
-                # 阈值 0.05 是为了过滤极低不透明度的噪点
-                dynamic_mask = (alpha > 0.05).detach()
-                valid_mask = alpha_mask * dynamic_mask
-            else:
-                valid_mask = alpha_mask
-            # 把不在 mask 里的像素全部置为 0（变黑），防止背景干扰
-            image = image * valid_mask
-            gt_image = gt_image * valid_mask
-                
-            # --- 计算基础损失 ---
-            # 分母加 eps 防止除零
-            Ll1 = torch.abs(image - gt_image).sum() / (valid_mask.sum() + 1e-6)
-            # SSIM 需要矩形窗口，Masked SSIM 实现比较复杂，这里简化：
-            # 如果是 Overlap 模式，可以暂时只用 L1，或者忽略 SSIM 的边界效应
-            if is_overlap_step:
-                loss_view = Ll1 # 简化，SSIM 在稀疏 Mask 下可能不稳定
-            else:
-                loss_view = (1.0 - opt.lambda_dssim) * l1_loss(image, gt_image) + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        if opt.lambda_dist and iteration > opt.dist_start_iter:
+            loss += opt.lambda_dist * (render_pkg["render_distort"].squeeze(3) * alpha_mask).mean()
         
-            # --- 计算正则化损失 ---
-            if opt.lambda_dreg > 0:
-                if scaling.shape[0] > 0:
-                    scaling_reg = scaling.prod(dim=1).mean()
-                else:
-                    scaling_reg = torch.tensor(0.0, device="cuda")
-                loss_view += opt.lambda_dreg * scaling_reg
-            
-            if opt.lambda_sky_opa > 0:
-                o = alpha.clamp(1e-6, 1-1e-6)
-                sky = alpha_mask.float()
-                # 注意：在 Overlap 模式下，天空可能不在 Frustum 内，这部分 Loss 应该慎重
-                # 这里简单起见，仅在非 Overlap 模式或确定有天空时应用
-                if not is_overlap_step:
-                    loss_sky_opa = (-(1-sky) * torch.log(1 - o)).mean()
-                    loss_view += opt.lambda_sky_opa * loss_sky_opa
-
-            # 深度损失
-            cur_Ll1depth = 0
-            if iteration > opt.start_depth and depth_l1_weight(iteration) > 0 and viewpoint_cam.invdepthmap is not None:
-                render_depth = render_pkg["render_depth"]
-                invDepth = torch.where(render_depth > 0.0, 1.0 / render_depth, torch.zeros_like(render_depth))            
-                mono_invdepth = viewpoint_cam.invdepthmap.cuda()
-                depth_mask = viewpoint_cam.depth_mask.cuda()
-                
-                if is_overlap_step:
-                    depth_mask = depth_mask * dynamic_mask
-
-                Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).sum() / (depth_mask.sum() + 1e-6)
-                Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
-                loss_view += Ll1depth
-                cur_Ll1depth = Ll1depth.item()
-            
-            total_loss += loss_view
-            total_Ll1depth += cur_Ll1depth
-
-        # [NEW] 恢复环境
-        if is_overlap_step:
-            # 恢复 Monkey Patch
-            gaussians.set_anchor_mask = original_set_anchor_mask
-            # 恢复原始 Mask (虽然 set_anchor_mask 稍后会被训练逻辑再次调用，但恢复是个好习惯)
-            gaussians._anchor_mask = original_anchor_mask
-            # 对总 Loss 取平均 (Batch Size = 2)
-            total_loss /= 2.0
-            total_Ll1depth /= 2.0
-            
-            # [LOGGING] 打印 Loss 详情
-            if iteration % 100 == 0:
-                logger.info(f"[ITER {iteration}] [OVERLAP OPT] Avg Loss: {total_loss.item():.6f} (Depth: {total_Ll1depth:.6f})")
-
+        # 深度损失
+        if iteration > opt.start_depth and depth_l1_weight(iteration) > 0 and viewpoint_cam.invdepthmap is not None:
+            assert gaussians.render_mode=="RGB+ED" or gaussians.render_mode=="RGB+D"
+            render_depth = render_pkg["render_depth"]
+            invDepth = torch.where(render_depth > 0.0, 1.0 / render_depth, torch.zeros_like(render_depth))            
+            mono_invdepth = viewpoint_cam.invdepthmap.cuda()
+            depth_mask = viewpoint_cam.depth_mask.cuda()
+            Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).mean()
+            Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
+            loss += Ll1depth
+            Ll1depth = Ll1depth.item()
+        else:
+            Ll1depth = 0
+    
         # --- 反向传播 ---
-        total_loss.backward()
+        loss.backward()
         
         iter_end.record()
 
         with torch.no_grad():
-            ema_loss_for_log = 0.4 * total_loss.item() + 0.6 * ema_loss_for_log
-            ema_Ll1depth_for_log = 0.4 * total_Ll1depth + 0.6 * ema_Ll1depth_for_log
+            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
                 psnr_log = psnr(image, gt_image).mean().double()
                 anchor_prim = len(gaussians.get_anchor) 
-                mode_str = "Overlap" if is_overlap_step else "Global"
-                progress_bar.set_postfix({"Mode": mode_str, "Loss": f"{ema_loss_for_log:.{7}f}","Depth": f"{ema_Ll1depth_for_log:.{5}f}","GS":f"{anchor_prim}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}","Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}","psnr":f"{psnr_log:.{3}f}","GS_num":f"{anchor_prim}","prefilter":f"{pipe.add_prefilter}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            training_report(tb_writer, dataset_name, iteration, torch.tensor(0.0), total_loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, getattr(modules, 'render'), (pipe, scene.background), wandb, logger)
+            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, getattr(modules, 'render'), (pipe, scene.background), wandb, logger)
             
             if (iteration in saving_iterations):
+                # [NEW] 使用 tqdm.write 避免破坏进度条格式
                 tqdm.write(f"[ITER {iteration}] Saving Gaussians")
                 scene.save(iteration)
 
             if iteration % pipe.vis_step == 0 or iteration == 1:
-                # 可视化代码 (略作简化，保持原逻辑)
-                # 注意：如果是 overlap step，这里可视化的 image 是 masked 的
+                other_img = []
+                resolution = (int(viewpoint_cam.image_width/5.0), int(viewpoint_cam.image_height/5.0))
+                vis_img = F.interpolate(image.unsqueeze(0), size=(resolution[1], resolution[0]), mode='bilinear', align_corners=False)[0]
+                vis_gt_img = F.interpolate(gt_image.unsqueeze(0), size=(resolution[1], resolution[0]), mode='bilinear', align_corners=False)[0]
+                vis_alpha = F.interpolate(alpha.repeat(3, 1, 1).unsqueeze(0), size=(resolution[1], resolution[0]), mode='bilinear', align_corners=False)[0]
+
+                if iteration > opt.start_depth and viewpoint_cam.invdepthmap is not None:
+                    vis_depth = visualize_depth(invDepth) 
+                    gt_depth = visualize_depth(mono_invdepth)
+                    vis_depth = F.interpolate(vis_depth.unsqueeze(0), size=(resolution[1], resolution[0]), mode='bilinear', align_corners=False)[0]
+                    vis_gt_depth = F.interpolate(gt_depth.unsqueeze(0), size=(resolution[1], resolution[0]), mode='bilinear', align_corners=False)[0]
+                    other_img.append(vis_depth)
+                    other_img.append(vis_gt_depth)
+                
+                grid = torchvision.utils.make_grid([
+                    vis_img, 
+                    vis_gt_img, 
+                    vis_alpha,
+                ] + other_img, nrow=3)
+
                 vis_path = os.path.join(scene.model_path, "vis")
                 os.makedirs(vis_path, exist_ok=True)
-                # 仅保存最后渲染的一张图
-                torchvision.utils.save_image(image, os.path.join(vis_path, f"{iteration:05d}_{viewpoint_cam.colmap_id:03d}.png"))
-            
-           # [FIX 1] 仅在重叠优化步（is_overlap_step=True）进行梯度统计
-            should_accumulate_stats = is_overlap_step if do_overlap_opt else True
-            # 如果您想极其严格地控制变量，甚至可以写成： should_accumulate_stats = is_overlap_step
+                torchvision.utils.save_image(grid, os.path.join(vis_path, f"{iteration:05d}_{viewpoint_cam.colmap_id:03d}.png"))
             
             if iteration < opt.update_until and iteration > opt.start_stat:
-                # 只有当这是重叠优化步时，才统计梯度
-                if should_accumulate_stats:
+                if  (viewpoint_cam.image_type == "aerial" and pipe.aerial_densify) \
+                    or (viewpoint_cam.image_type == "street" and pipe.street_densify) :
                     gaussians.training_statis(opt, render_pkg, image.shape[2], image.shape[1])
                     densify_cnt += 1 
 
                 if opt.densification and iteration > opt.update_from and densify_cnt > 0 and densify_cnt % opt.update_interval == 0:
+                    if dataset.pretrained_checkpoint != "":
+                        gaussians.roll_back()
                     gaussians.run_densify(opt, iteration)
             
             elif iteration == opt.update_until:
+                if dataset.pretrained_checkpoint != "":
+                    gaussians.roll_back()
                 gaussians.clean()
                     
             if iteration < opt.iterations:
@@ -626,6 +424,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 pipe.add_prefilter = False
 
             if (iteration in checkpoint_iterations):
+                # [NEW] 使用 tqdm.write
                 tqdm.write(f"[ITER {iteration}] Saving Checkpoint")
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
@@ -657,16 +456,52 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
     记录训练状态，并在测试集上进行评估。
     """
     if tb_writer:
+        tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/iter_time', elapsed, iteration)
 
     if wandb is not None:
-        wandb.log({'train_total_loss':loss, })
+        wandb.log({"train_l1_loss":Ll1, 'train_total_loss':loss, })
     
+    # --- [修改开始] 评估与日志记录逻辑 ---
     if iteration in testing_iterations:
         scene.gaussians.eval()
         torch.cuda.empty_cache()
         
+        # ==========================================================
+        # [NEW] 修复高斯数量统计逻辑
+        # ==========================================================
+        
+        # 1. 获取锚点数量 (静态存储的数量)
+        num_anchors = len(scene.gaussians.get_anchor)
+        
+        # 2. 获取实际高斯球数量 (动态生成的数量)
+        # HorizonGS/ScaffoldGS 在渲染时会基于锚点生成 n_offsets 个高斯
+        # 我们通过执行一次推理(render)来获取 render_pkg，查看其中 scaling 的维度
+        try:
+            # 临时取训练集的第一个相机进行一次“试渲染”
+            temp_cam = scene.getTrainCameras()[0]
+            with torch.no_grad():
+                # renderArgs 是 (pipe, scene.background)
+                temp_pkg = renderFunc(temp_cam, scene.gaussians, *renderArgs)
+                # scaling 的形状通常是 [Num_Gaussians, 3]，这才是真正的生成数量
+                num_gaussians = temp_pkg["scaling"].shape[0]
+        except Exception as e:
+            # 如果出错（例如内存不足），回退到读取 xyz 大小，并打印警告
+            num_gaussians = scene.gaussians.get_xyz.shape[0]
+            if logger: logger.warning(f"无法计算动态高斯数量，回退到静态数量。错误: {e}")
+
+        # 3. 计算倍率 (每个锚点生成了多少个高斯)
+        ratio = num_gaussians / num_anchors if num_anchors > 0 else 0
+
+        if logger:
+            logger.info("=" * 40)
+            logger.info(f"[ITER {iteration}] 统计信息 (Statistics):")
+            logger.info(f"  > 锚点数量 (Anchor Num)   : {num_anchors}")
+            logger.info(f"  > 高斯数量 (Gaussian Num) : {num_gaussians} (倍率: {ratio:.1f}x)")
+            logger.info("=" * 40)
+        # ==========================================================
+
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                             {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx] for idx in range(0, len(scene.getTrainCameras()), 100)]})
 
@@ -679,6 +514,11 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                 psnr_test_street = 0.0
                 street_cnt = 0
                 
+                if wandb is not None:
+                    gt_image_list = []
+                    render_image_list = []
+                    errormap_list = []
+
                 for idx, viewpoint in enumerate(config['cameras']):
                     
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
@@ -691,6 +531,15 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=iteration)
 
+                        if wandb:
+                            render_image_list.append(image[None])
+                            errormap_list.append((gt_image[None]-image[None]).abs())
+                            
+                    if iteration == testing_iterations[0]:
+                        tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                        if wandb:
+                            gt_image_list.append(gt_image[None])
+                
                     if viewpoint.image_type == "aerial":
                         l1_test_aerial += l1_loss(image, gt_image).mean().double()
                         psnr_test_aerial += psnr(image, gt_image).mean().double()
@@ -700,15 +549,20 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                         psnr_test_street += psnr(image, gt_image).mean().double()
                         street_cnt += 1 
                 
-                # [NEW] 使用 tqdm.write 避免破坏进度条
+                # 使用 logger 记录评估结果到 output.log
                 if scene.add_aerial and aerial_cnt > 0:
                     l1_test_aerial /= aerial_cnt
-                    psnr_test_aerial /= aerial_cnt    
-                    tqdm.write("[ITER {}] Evaluating {} Aerial: L1 {} PSNR {}".format(iteration, config['name'], l1_test_aerial, psnr_test_aerial))
-                if scene.add_street and street_cnt > 0:       
+                    psnr_test_aerial /= aerial_cnt     
+                    msg = "[ITER {}] Evaluating {} Aerial: L1 {:.6f} PSNR {:.6f}".format(iteration, config['name'], l1_test_aerial, psnr_test_aerial)
+                    tqdm.write(msg)
+                    if logger: logger.info(msg) 
+
+                if scene.add_street and street_cnt > 0:        
                     l1_test_street /= street_cnt
-                    psnr_test_street /= street_cnt       
-                    tqdm.write("[ITER {}] Evaluating {} Street: L1 {} PSNR {}".format(iteration, config['name'], l1_test_street, psnr_test_street))
+                    psnr_test_street /= street_cnt        
+                    msg = "[ITER {}] Evaluating {} Street: L1 {:.6f} PSNR {:.6f}".format(iteration, config['name'], l1_test_street, psnr_test_street)
+                    tqdm.write(msg)
+                    if logger: logger.info(msg)
                 
         if tb_writer:
             tb_writer.add_scalar(f'{dataset_name}/'+'total_points', len(scene.gaussians.get_anchor), iteration)
@@ -1052,14 +906,19 @@ if __name__ == "__main__":
     # 获取 Logger
     logger = get_logger(lp.model_path)
 
+   # [NEW] 修改这里：将间隔从 10000 改为 500
     # 设置默认的测试和保存迭代点 (如果没有指定)
     if args.test_iterations[0] == -1:
-        args.test_iterations = [i for i in range(10000, op.iterations + 1, 10000)]
+        args.test_iterations = [i for i in range(500, op.iterations + 1, 500)]
+    
+    # 确保最后一次迭代一定在列表中
     if len(args.test_iterations) == 0 or args.test_iterations[-1] != op.iterations:
         args.test_iterations.append(op.iterations)
 
     if args.save_iterations[0] == -1:
-        args.save_iterations = [i for i in range(10000, op.iterations + 1, 10000)]
+        args.save_iterations = [i for i in range(500, op.iterations + 1, 500)]
+    
+    # 确保最后一次迭代一定在列表中
     if len(args.save_iterations) == 0 or args.save_iterations[-1] != op.iterations:
         args.save_iterations.append(op.iterations)
 
