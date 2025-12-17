@@ -76,4 +76,3 @@ class Embedding(FieldComponent):
             in_tensor: input tensor to process
         """
         return self.embedding(in_tensor)
-

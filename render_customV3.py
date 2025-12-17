@@ -32,8 +32,8 @@ IS_RUNNING = True
 old_terminal_attr = None 
 
 # 步长设置
-MOVE_STEP = 0.1
-ANGLE_STEP = 0.1
+MOVE_STEP = 0.005
+ANGLE_STEP = 0.05
 
 # 全局配置 (由命令行参数设置)
 GLOBAL_SCALE_FACTOR = 1.0 

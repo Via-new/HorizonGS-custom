@@ -14,7 +14,6 @@ import shutil
 import numpy as np
 import json
 import struct
-# Ensure torch.nn is imported
 import torch.nn as nn
 from utils.general_utils import build_rotation # Used to build rotation matrix from quaternion
 
@@ -76,58 +75,29 @@ def saveRuntimeCode(dst: str, logger=None) -> None:
     additionalIgnorePatterns = ['.git', '.gitignore']
     ignorePatterns = set()
     ROOT = '.'
-    assert os.path.exists(os.path.join(ROOT, '.gitignore'))
-    with open(os.path.join(ROOT, '.gitignore')) as gitIgnoreFile:
-        for line in gitIgnoreFile:
-            if not line.startswith('#'):
-                if line.endswith('\n'):
-                    line = line[:-1]
-                if line.endswith('/'):
-                    line = line[:-1]
-                ignorePatterns.add(line)
+    if os.path.exists(os.path.join(ROOT, '.gitignore')):
+        with open(os.path.join(ROOT, '.gitignore')) as gitIgnoreFile:
+            for line in gitIgnoreFile:
+                if not line.startswith('#'):
+                    if line.endswith('\n'):
+                        line = line[:-1]
+                    if line.endswith('/'):
+                        line = line[:-1]
+                    ignorePatterns.add(line)
     ignorePatterns = list(ignorePatterns)
     for additionalPattern in additionalIgnorePatterns:
         ignorePatterns.append(additionalPattern)
 
     log_dir = Path(__file__).resolve().parent
 
-    shutil.copytree(log_dir, dst, ignore=shutil.ignore_patterns(*ignorePatterns))
-    
-    if logger:
-        logger.info('Backup Finished!')
-    else:
-        print('Backup Finished!')
-
-# ================= [DIAGNOSIS HELPER FUNCTIONS START] =================
-def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
-    data = fid.read(num_bytes)
-    return struct.unpack(endian_character + format_char_sequence, data)
-
-def read_images_binary_debug(path_to_model_file):
-    images = {}
     try:
-        with open(path_to_model_file, "rb") as fid:
-            num_reg_images = read_next_bytes(fid, 8, "Q")[0]
-            for _ in range(num_reg_images):
-                binary_image_properties = read_next_bytes(fid, 64, "i4d3di")
-                image_id = binary_image_properties[0]
-                qvec = np.array(binary_image_properties[1:5])
-                tvec = np.array(binary_image_properties[5:8])
-                camera_id = binary_image_properties[8]
-                image_name = ""
-                current_char = read_next_bytes(fid, 1, "c")[0]
-                while current_char != b"\x00":
-                    image_name += current_char.decode("utf-8")
-                    current_char = read_next_bytes(fid, 1, "c")[0]
-                num_points2D = read_next_bytes(fid, 8, "Q")[0]
-                # Skip points data
-                fid.seek(24 * num_points2D, 1)
-                images[image_id] = {"id": image_id, "name": image_name}
+        shutil.copytree(log_dir, dst, ignore=shutil.ignore_patterns(*ignorePatterns))
+        if logger:
+            logger.info('Backup Finished!')
+        else:
+            print('Backup Finished!')
     except Exception as e:
-        print(f"[DEBUG READ ERROR] {e}")
-    return images
-# ================= [DIAGNOSIS HELPER FUNCTIONS END] =================
-
+        if logger: logger.warning(f"Backup failed: {e}")
 
 # ================= [NEW] Pose Optimization Module Start =================
 
@@ -184,7 +154,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     """
     first_iter = 0
     # Prepare output folder
-    # [Modified] Pass logger to prepare_output_and_logger
     tb_writer = prepare_output_and_logger(dataset, logger)
 
     # Dynamic import
@@ -193,19 +162,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     gaussians = getattr(modules, model_config['name'])(**model_config['kwargs'])
     
     # ================= [DIAGNOSIS LOGIC START] =================
-    logger.info("\n" + "="*20 + " Depth Params & COLMAP Consistency Check " + "="*20)
+    logger.info("\n" + "="*20 + " Depth Params Check " + "="*20)
     json_path = os.path.join(dataset.source_path, "sparse", "0", "depth_params.json")
-    
     if os.path.exists(json_path):
         logger.info(f"[JSON] File found: {json_path}")
-        try:
-            with open(json_path, 'r') as f:
-                json.load(f)
-            logger.info(f"[JSON] File format correct.")
-        except Exception as e:
-            logger.error(f"[JSON] File corrupted: {e}")
     else:
-        logger.error(f"[JSON] Warning: {json_path} not found. Error will occur if add_depth is enabled.")
+        logger.warning(f"[JSON] Warning: {json_path} not found.")
     logger.info("="*60 + "\n")
     # ================= [DIAGNOSIS LOGIC END] =================
 
@@ -217,11 +179,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     aerial_count = 0
     street_count = 0
     
-    # [NEW] Count loaded Depth and Masks
-    depth_loaded_count = 0
-    mask_loaded_count = 0
-    total_train_cams = len(scene.getTrainCameras())
-
     for cam in scene.getTrainCameras():
         img_name = cam.image_name.lower()
         if "street" in img_name:
@@ -233,42 +190,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         else:
             cam.image_type = "aerial"
             aerial_count += 1
-        
-        # [NEW] Check Depth
-        if cam.invdepthmap is not None:
-            depth_loaded_count += 1
-            
-        # [NEW] Check Mask
-        if cam.alpha_mask is not None:
-            mask_loaded_count += 1
             
     logger.info(f"Manual Classification Result: Aerial={aerial_count}, Street={street_count}")
     
-    # [NEW] Print Depth and Mask statistics
-    logger.info("-" * 50)
-    logger.info(f"Data Loading Integrity Check (Train Set):")
-    logger.info(f"  Total Cameras : {total_train_cams}")
-    logger.info(f"  Depth Maps    : {depth_loaded_count} / {total_train_cams} ({(depth_loaded_count/total_train_cams)*100:.1f}%)")
-    logger.info(f"  Masks         : {mask_loaded_count} / {total_train_cams} ({(mask_loaded_count/total_train_cams)*100:.1f}%)")
-    
-    if dataset.add_depth and depth_loaded_count < total_train_cams:
-        logger.warning(f"Warning: add_depth enabled, but {total_train_cams - depth_loaded_count} images failed to load depth maps!")
-    elif dataset.add_depth:
-        logger.info("Success: All depth maps loaded.")
-
-    if dataset.add_mask and mask_loaded_count < total_train_cams:
-        logger.warning(f"Warning: add_mask enabled, but {total_train_cams - mask_loaded_count} images failed to load masks!")
-    elif dataset.add_mask:
-        logger.info("Success: All masks loaded.")
-    logger.info("-" * 50)
-
-    # Safety check
-    if street_count == 0 and pipe.camera_balance:
-        logger.warning("WARNING: No street cameras found even after manual fix! Disabling camera_balance.")
-        pipe.camera_balance = False
-    
     scene.add_aerial = (aerial_count > 0)
     scene.add_street = (street_count > 0)
+    if street_count == 0 and pipe.camera_balance:
+        pipe.camera_balance = False
     # ================= [Fix End] =================
 
     # 1. Initial setup
@@ -279,6 +207,51 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
     
+
+    # ================= [New] Pre-training Evaluation =================
+    logger.info("\n" + "="*20 + " PRE-TRAINING EVALUATION " + "="*20)
+    logger.info("Checking model performance before fine-tuning starts...")
+    
+    pkg_for_render = __import__('gaussian_renderer')
+    
+    with torch.no_grad():
+        if first_iter not in testing_iterations:
+            testing_iterations.append(first_iter)
+        
+        training_report(
+            tb_writer, dataset_name, first_iter, 
+            torch.tensor(0.0), torch.tensor(0.0), l1_loss, 
+            0, testing_iterations, scene, getattr(pkg_for_render, 'render'), 
+            (pipe, scene.background), wandb, logger
+        )
+    logger.info("="*60 + "\n")
+    # ===========================================================================
+
+    # ================= [Modify] Initialize Pose Optimizer =================
+    pose_optimizer = None
+    pose_correction_net = None
+    
+    train_cameras = scene.getTrainCameras()
+    street_cams = [c for c in train_cameras if c.image_type == "street"]
+    
+    DO_POSE_OPTIMIZATION = len(street_cams) > 0 
+    
+    if DO_POSE_OPTIMIZATION:
+        logger.info(f"Pose Optimization Enabled: Targeting {len(street_cams)} street cameras")
+        pose_correction_net = CameraPoseCorrection(street_cams).to("cuda")
+        
+        lr_rot = 1e-6  
+        lr_trans = 1e-5 
+        
+        logger.info(f"Pose Optimization LR: Rotation={lr_rot}, Translation={lr_trans}")
+        
+        pose_params = [
+            {'params': pose_correction_net.q_delta, 'lr': lr_rot, 'name': 'q_delta'},
+            {'params': pose_correction_net.t_delta, 'lr': lr_trans, 'name': 't_delta'}
+        ]
+        pose_optimizer = torch.optim.Adam(pose_params, eps=1e-15)
+    # ========================================================
+
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
     
@@ -294,7 +267,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_Ll1depth_for_log = 0.0
     densify_cnt = 0
     
-    # [NEW] Optimized progress bar
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress", leave=True, dynamic_ncols=True, mininterval=0.5)
     first_iter += 1
     modules = __import__('gaussian_renderer')
@@ -338,6 +310,34 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if not viewpoint_stack:
                 viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+
+        # ================= [Fix] Dynamic Pose Correction (Relative) =================
+        current_pose_optimized = False
+        
+        if DO_POSE_OPTIMIZATION and viewpoint_cam.image_type == "street":
+            current_pose_optimized = True
+            
+            # 1. Backup original state
+            old_w2c = viewpoint_cam.world_view_transform
+            old_proj = viewpoint_cam.full_proj_transform
+            old_center = viewpoint_cam.camera_center
+            
+            # 2. Compute corrected view matrix
+            new_view_matrix = pose_correction_net(
+                viewpoint_cam.uid, 
+                old_w2c 
+            )
+            
+            # 3. Override camera object
+            viewpoint_cam.world_view_transform = new_view_matrix
+            
+            # 4. Sync projection matrix
+            proj_matrix = viewpoint_cam.projection_matrix
+            viewpoint_cam.full_proj_transform = (new_view_matrix.unsqueeze(0).bmm(proj_matrix.unsqueeze(0))).squeeze(0)
+            
+            # 5. Sync camera center
+            viewpoint_cam.camera_center = new_view_matrix.inverse()[3, :3]
+        # ========================================================================
 
         # --- Forward ---
         render_pkg = getattr(modules, 'render')(viewpoint_cam, gaussians, pipe, scene.background)
@@ -406,6 +406,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         iter_end.record()
 
+        # ================= [Modify] Restore State & Optimizer Step =================
+        if current_pose_optimized:
+            # Step 1: Optimizer step
+            pose_optimizer.step()
+            pose_optimizer.zero_grad()
+            
+            # Step 2: Restore Camera object
+            viewpoint_cam.world_view_transform = old_w2c
+            viewpoint_cam.full_proj_transform = old_proj
+            viewpoint_cam.camera_center = old_center
+        # ================================================================
+
         with torch.no_grad():
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
@@ -418,10 +430,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, getattr(modules, 'render'), (pipe, scene.background), wandb, logger)
+            # Pass pose_correction_net
+            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, getattr(modules, 'render'), (pipe, scene.background), wandb, logger, pose_correction_net)
             
             if (iteration in saving_iterations):
-                # [NEW] Log saving info to outputs.log
                 msg = f"[ITER {iteration}] Saving Gaussians"
                 tqdm.write(msg)
                 if logger: logger.info(msg)
@@ -476,7 +488,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 pipe.add_prefilter = False
 
             if (iteration in checkpoint_iterations):
-                # [NEW] Log saving info to outputs.log
                 msg = f"[ITER {iteration}] Saving Checkpoint"
                 tqdm.write(msg)
                 if logger: logger.info(msg)
@@ -485,7 +496,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 def prepare_output_and_logger(args, logger=None):
     """
     Prepare output directory and tensorboard.
-    [Modified] Accepts logger argument to replace print statements.
     """
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -494,12 +504,11 @@ def prepare_output_and_logger(args, logger=None):
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
         
-    # [Modified] Use logger if available, otherwise print
     if logger:
         logger.info("Output folder: {}".format(args.model_path))
     else:
         print("Output folder: {}".format(args.model_path))
-        
+
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
@@ -514,7 +523,7 @@ def prepare_output_and_logger(args, logger=None):
             print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
+def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None, pose_correction_net=None):
     """
     Report training status and evaluate on test set.
     """
@@ -549,12 +558,43 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
 
                 for idx, viewpoint in enumerate(config['cameras']):
                     
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    alpha_mask = viewpoint.alpha_mask.cuda()
-                    image = image * alpha_mask
-                    gt_image = gt_image * alpha_mask
-                    
+                    # ================= [New] Apply Pose Correction during Eval =================
+                    applied_pose_correction = False
+                    old_w2c = viewpoint.world_view_transform
+                    old_proj = viewpoint.full_proj_transform
+                    old_center = viewpoint.camera_center
+
+                    try:
+                        # Check
+                        if pose_correction_net is not None and viewpoint.image_type == "street":
+                            if viewpoint.uid in pose_correction_net.camera_map:
+                                applied_pose_correction = True
+                                # Compute corrected pose
+                                new_view_matrix = pose_correction_net(viewpoint.uid, old_w2c)
+                                
+                                # Override
+                                viewpoint.world_view_transform = new_view_matrix
+                                proj_matrix = viewpoint.projection_matrix
+                                viewpoint.full_proj_transform = (new_view_matrix.unsqueeze(0).bmm(proj_matrix.unsqueeze(0))).squeeze(0)
+                                viewpoint.camera_center = new_view_matrix.inverse()[3, :3]
+                        # =============================================================
+
+                        # Render
+                        image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                        gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                        alpha_mask = viewpoint.alpha_mask.cuda()
+                        image = image * alpha_mask
+                        gt_image = gt_image * alpha_mask
+                        
+                    finally:
+                        # ================= [New] Restore Camera State =================
+                        # 使用 finally 确保即使渲染报错，相机位姿也能恢复，否则会污染后续流程
+                        if applied_pose_correction:
+                            viewpoint.world_view_transform = old_w2c
+                            viewpoint.full_proj_transform = old_proj
+                            viewpoint.camera_center = old_center
+                        # =========================================================
+
                     if tb_writer and (idx < 30):
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=iteration)

@@ -16,9 +16,7 @@ import torch
 from scene.base_model import GaussianModel
 from scene.lod_model import GaussianLoDModel
 from utils.system_utils import searchForMaxIteration
-
-# 修改为：
-from scene.dataset_readers import sceneLoadTypeCallbacks, storePly, fetchPly
+from scene.dataset_readers import sceneLoadTypeCallbacks, storePly
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from utils.graphics_utils import BasicPointCloud
 import numpy as np
@@ -85,26 +83,6 @@ class Scene:
         else:
             assert False, "Could not recognize scene type!"
             
-        #         # =========================================================
-        # # ### 修改开始：强制加载自定义 input.ply ###
-        # # =========================================================
-        # custom_ply_path = os.path.join(args.source_path, "input.ply")
-        # if os.path.exists(custom_ply_path):
-        #     print(f"\n[INFO] Found custom point cloud at {custom_ply_path}!")
-        #     print("[INFO] Replacing COLMAP sparse points with custom dense initialization...")
-            
-        #     # 读取你的 ply 文件
-        #     custom_pcd = fetchPly(custom_ply_path)
-            
-        #     # 替换 scene_info 中的 point_cloud
-        #     # 注意：scene_info 是一个 NamedTuple，需要用 _replace 方法
-        #     scene_info = scene_info._replace(point_cloud=custom_pcd)
-        # else:
-        #     print(f"\n[INFO] Custom input.ply not found in {args.source_path}, using default sparse points.")
-        # # =========================================================
-        # # ### 修改结束 ###
-        # # =========================================================    
-
         if not self.loaded_iter:
             logger.info("Train cameras: {}".format(len(scene_info.train_cameras)))
             logger.info("Test cameras: {}".format(len(scene_info.test_cameras)))
