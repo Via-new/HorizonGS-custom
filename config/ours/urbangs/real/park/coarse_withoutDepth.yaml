@@ -1,11 +1,11 @@
 
 # Model Parameters
 model_params: {
-    model_config: {'name': 'GaussianLoDModel', 'kwargs': {'fork': 2, 'gs_attr': '3D', 'color_attr': 'RGB', 'feat_dim': 32, 'view_dim': 3, 'appearance_dim': 0, 'n_offsets': 10, 'voxel_size': 0.001, 'render_mode': 'RGB+ED', 'standard_dist': 34.41826629638671875, 'aerial_levels': 3, 'street_levels': 5}},
+    model_config: {'name': 'GaussianLoDModel', 'kwargs': {'fork': 2, 'gs_attr': '3D', 'color_attr': 'RGB', 'feat_dim': 32, 'view_dim': 3, 'appearance_dim': 0, 'n_offsets': 10, 'voxel_size': 0.001, 'render_mode': 'RGB+ED', 'standard_dist': 64.24078369140625, 'aerial_levels': 3, 'street_levels': 5}},
     pretrained_checkpoint: '',
     global_appearance: '',
     dataset_name: horizongs,
-    scene_name: real/road/coarse_withoutDepth,
+    scene_name: real/park/coarse_withoutDepth,
     images: images,
     resolution: -1,
     white_background: False,
@@ -20,7 +20,7 @@ model_params: {
     add_aerial: True,
     add_street: True,
     llffhold: 32,
-    source_path: "data/HorizonGS_data/real/road"
+    source_path: "data/HorizonGS_data/real/park"
 }
 
 # Pipeline Parameters
