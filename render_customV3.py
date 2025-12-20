@@ -22,24 +22,22 @@ result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode()
 os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
 print(f"Using GPU: {os.environ['CUDA_VISIBLE_DEVICES']}")
 
-# ================= 全局变量与锁 =================
+# ================= 全局变量 =================
 CAM_STATE = {
-    'x': 0.0, 'y': 0.0, 'z': 0.0,      # 位置偏移
-    'pitch': 0.0, 'yaw': 0.0, 'roll': 0.0 # 角度偏移
+    'x': 0.0, 'y': 0.0, 'z': 0.0,
+    'pitch': 0.0, 'yaw': 0.0, 'roll': 0.0
 }
 STATE_LOCK = threading.Lock()
 IS_RUNNING = True
+CLIENT_CONNECTED = False  # [新增] 连接状态标志
 old_terminal_attr = None 
 
-# 步长设置
 MOVE_STEP = 0.005
 ANGLE_STEP = 0.05
-
-# 全局配置 (由命令行参数设置)
 GLOBAL_SCALE_FACTOR = 1.0 
-TARGET_FPS = 60.0  # 目标FPS
+TARGET_FPS = 60.0
 
-# ================= 终端控制工具函数 =================
+# ================= 终端控制 =================
 def set_terminal_raw_mode():
     global old_terminal_attr
     fd = sys.stdin.fileno()
@@ -55,7 +53,7 @@ def restore_terminal_mode():
         fd = sys.stdin.fileno()
         termios.tcsetattr(fd, termios.TCSANOW, old_terminal_attr)
 
-# ================= 数学工具函数 =================
+# ================= 数学工具 =================
 def get_rotation_matrix(rx, ry, rz):
     rx = np.radians(rx)
     ry = np.radians(ry)
@@ -67,13 +65,8 @@ def get_rotation_matrix(rx, ry, rz):
 
 # ================= 线程 1: 键盘监听 =================
 def keyboard_listener_thread():
-    print(">>> Keyboard Control Enabled <<<")
-    print("Move: W/S (X), A/D (Y), Q/E (Z)")
-    print("Rotate: I/K (Pitch), J/L (Yaw), U/O (Roll)")
-    print("Press Ctrl+C to exit.")
-    
+    print(">>> Keyboard Control Enabled (W/S/A/D/Q/E + I/K/J/L/U/O) <<<")
     set_terminal_raw_mode()
-    
     try:
         while IS_RUNNING:
             try:
@@ -85,20 +78,6 @@ def keyboard_listener_thread():
                 key = key.lower()
                 need_print = False 
                 
-                # with STATE_LOCK:
-                #     if key == 'w': CAM_STATE['x'] += MOVE_STEP; need_print = True
-                #     elif key == 's': CAM_STATE['x'] -= MOVE_STEP; need_print = True
-                #     elif key == 'a': CAM_STATE['y'] += MOVE_STEP; need_print = True
-                #     elif key == 'd': CAM_STATE['y'] -= MOVE_STEP; need_print = True
-                #     elif key == 'q': CAM_STATE['z'] -= MOVE_STEP; need_print = True
-                #     elif key == 'e': CAM_STATE['z'] += MOVE_STEP; need_print = True
-                #     elif key == 'i': CAM_STATE['pitch'] += ANGLE_STEP; need_print = True
-                #     elif key == 'k': CAM_STATE['pitch'] -= ANGLE_STEP; need_print = True
-                #     elif key == 'j': CAM_STATE['yaw'] -= ANGLE_STEP; need_print = True
-                #     elif key == 'l': CAM_STATE['yaw'] += ANGLE_STEP; need_print = True
-                #     elif key == 'u': CAM_STATE['roll'] -= ANGLE_STEP; need_print = True
-                #     elif key == 'o': CAM_STATE['roll'] += ANGLE_STEP; need_print = True
-
                 with STATE_LOCK:
                     if key == 'w': CAM_STATE['y'] -= MOVE_STEP; need_print = True
                     elif key == 's': CAM_STATE['y'] += MOVE_STEP; need_print = True
@@ -114,165 +93,152 @@ def keyboard_listener_thread():
                     elif key == 'o': CAM_STATE['pitch'] += ANGLE_STEP; need_print = True
                 
                 if need_print:
-                    info_str = (
-                        f"\r[Camera] Pos(X,Y,Z): {CAM_STATE['x']:.1f}, {CAM_STATE['y']:.1f}, {CAM_STATE['z']:.1f} | "
-                        f"Rot(P,Y,R): {CAM_STATE['pitch']:.0f}, {CAM_STATE['yaw']:.0f}, {CAM_STATE['roll']:.0f}      "
-                    )
-                    print(info_str, end="", flush=True)
+                    print(f"\r[Cam] Pos: {CAM_STATE['x']:.2f},{CAM_STATE['y']:.2f},{CAM_STATE['z']:.2f} | Rot: {CAM_STATE['pitch']:.1f},{CAM_STATE['yaw']:.1f},{CAM_STATE['roll']:.1f}      ", end="", flush=True)
 
-            except IOError:
-                pass
-            except Exception as e:
-                pass
+            except IOError: pass
+            except Exception: pass
     finally:
         restore_terminal_mode()
-        print("\nKeyboard listener stopped.")
 
 # ================= 线程 2: 网络发送 =================
 def socket_sender_thread(conn, img_queue):
-    print(f"[Sender Thread] Started. Scale: {GLOBAL_SCALE_FACTOR}")
+    global CLIENT_CONNECTED
+    print(f"[Sender] Thread Started. Scale: {GLOBAL_SCALE_FACTOR}")
     try:
-        while IS_RUNNING:
+        # [修改] 只有当主程序运行且客户端连接标志为 True 时才运行
+        while IS_RUNNING and CLIENT_CONNECTED:
             try:
-                img_np = img_queue.get(timeout=1.0) 
+                img_np = img_queue.get(timeout=0.5) 
             except:
-                continue
+                continue # Queue empty, check connection status again
             
             if img_np is None: break
 
-            if img_np.shape[2] == 4:
-                img_np = img_np[:, :, :3]
-            
+            if img_np.shape[2] == 4: img_np = img_np[:, :, :3]
             img_uint8 = (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
             img_bgr = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2BGR)
             
             if GLOBAL_SCALE_FACTOR != 1.0:
                 h, w = img_bgr.shape[:2]
-                new_w = int(w * GLOBAL_SCALE_FACTOR)
-                new_h = int(h * GLOBAL_SCALE_FACTOR)
-                img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                img_bgr = cv2.resize(img_bgr, (int(w*GLOBAL_SCALE_FACTOR), int(h*GLOBAL_SCALE_FACTOR)))
 
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-            success, encimg = cv2.imencode('.jpg', img_bgr, encode_param)
-            
+            success, encimg = cv2.imencode('.jpg', img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             if not success: continue
 
             data = encimg.tobytes()
-            size = len(data)
-
             try:
-                conn.sendall(size.to_bytes(4, byteorder='big'))
+                conn.sendall(len(data).to_bytes(4, byteorder='big'))
                 conn.sendall(data)
             except (BrokenPipeError, ConnectionResetError):
-                print("\n[Sender Thread] Client disconnected.")
+                print("\n[Sender] Client disconnected detected.")
+                CLIENT_CONNECTED = False # [关键] 改变标志位，通知渲染循环停止
                 break
-            
     except Exception as e:
-        print(f"[Sender Thread] Error: {e}")
+        print(f"[Sender] Error: {e}")
+        CLIENT_CONNECTED = False
 
-# ================= 线程 3 (主线程): 渲染循环 =================
-def render_continuous_loop(img_queue, dataset, pipe, iteration, ape_code, explicit):
+# ================= 阶段 1: 加载场景 (只运行一次) =================
+def load_scene_once(dataset, pipe, iteration, ape_code, explicit):
+    print(">>> Loading Scene Models (This happens only once) <<<")
     with torch.no_grad():
         if pipe.no_prefilter_step > 0: pipe.add_prefilter = False
         else: pipe.add_prefilter = True
             
-        print("Loading Scene...")
         scene_modules = __import__('scene')
-        renderer_modules = __import__('gaussian_renderer')
+        renderer_modules = __import__('gaussian_renderer') # 这里只为了确认模块存在
         
         model_config = dataset.model_config
         model_config['kwargs']['ape_code'] = ape_code
         gaussians = getattr(scene_modules, model_config['name'])(**model_config['kwargs'])
         scene = scene_modules.Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, explicit=explicit)
-
-        # === 添加调试代码 ===
-        print(f"Total cameras loaded: {len(scene.getTrainCameras()) + len(scene.getTestCameras())}")
-        all_cams = scene.getTrainCameras() + scene.getTestCameras()
-        if len(all_cams) > 0:
-            print(f"Sample camera name: {all_cams[0].image_name}")
-            print(f"Sample camera type: {all_cams[0].image_type}")
-            
-        # 打印所有检测到的类型
-        types = set([c.image_type for c in all_cams])
-        print(f"Detected image types: {types}")
-        # ===================
-
         gaussians.eval()
 
-        all_cameras = scene.getTrainCameras() + scene.getTestCameras()
-        aerial_views = [c for c in all_cameras if c.image_type == "aerial"]
-        street_views = [c for c in all_cameras if c.image_type == "street"]
-        
-        if not aerial_views:
-            print("Error: No aerial views found!")
-            return
-        view = street_views[0]
-        # view = aerial_views[65]
-        # view = street_views[87]
-        if isinstance(view.R, torch.Tensor): R_orig = view.R.cpu().numpy()
-        else: R_orig = view.R.copy()
-        
-        if isinstance(view.T, torch.Tensor): T_orig = view.T.cpu().numpy()
-        else: T_orig = view.T.copy()
-        
-        center_orig = -np.dot(R_orig.T, T_orig)
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
         
-        print(f">>> Rendering Loop Started (Limit: {TARGET_FPS} FPS) <<<")
-        last_warning_time = 0.0
-        
-        # [关键] 计算目标帧间隔
-        target_frame_time = 1.0 / TARGET_FPS
+        return scene, gaussians, background, renderer_modules
 
-        while IS_RUNNING:
-            loop_start_time = time.time() # 记录开始时间
+# ================= 阶段 2: 渲染循环 (每次连接运行) =================
+def render_loop(scene, gaussians, background, renderer_modules, pipe, img_queue, start_image_name=None):
+    # [重置] 每次新连接时，重置相机偏移量
+    global CAM_STATE
+    with STATE_LOCK:
+        CAM_STATE = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'pitch': 0.0, 'yaw': 0.0, 'roll': 0.0}
 
-            try:
-                with STATE_LOCK:
-                    curr_x = CAM_STATE['x']
-                    curr_y = CAM_STATE['y']
-                    curr_z = CAM_STATE['z']
-                    curr_p = CAM_STATE['pitch']
-                    curr_y_angle = CAM_STATE['yaw']
-                    curr_r = CAM_STATE['roll']
-                
-                new_center = center_orig + np.array([curr_x, curr_y, curr_z], dtype=np.float32)
-                R_delta = get_rotation_matrix(curr_p, curr_y_angle, curr_r)
-                R_new = np.dot(R_delta, R_orig)
-                T_new = -np.dot(R_new, new_center)
-                
-                view.R = R_new
-                view.T = T_new
-                view_matrix = getWorld2View2(view.R, view.T, view.trans, view.scale)
-                view.world_view_transform = torch.tensor(view_matrix).transpose(0, 1).cuda()
-                view.camera_center = view.world_view_transform.inverse()[3, :3]
-
-                render_pkg = getattr(renderer_modules, 'render')(view, gaussians, pipe, background)
-                rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
-                
-                img_np = rendering.detach().permute(1, 2, 0).cpu().numpy()
-                
-                try:
-                    img_queue.put_nowait(img_np)
-                except Full:
-                    current_time = time.time()
-                    if current_time - last_warning_time > 5.0: # 减少报警频率
-                        print(f"\n[Warning] Send Queue Full! (Your GPU > Network).")
-                        last_warning_time = current_time
-                    pass
-
-                # [关键] 动态休眠以稳定 FPS
-                # 计算渲染和入队花费了多少时间
-                elapsed = time.time() - loop_start_time
-                # 如果花费时间少于目标间隔，就睡一会儿
-                if elapsed < target_frame_time:
-                    time.sleep(target_frame_time - elapsed)
-
-            except Exception as e:
-                print(f"Render Error: {e}")
+    # --- 寻找初始视角 ---
+    all_cameras = scene.getTrainCameras() + scene.getTestCameras()
+    selected_view = None
+    
+    if start_image_name:
+        print(f"Searching for initial view: {start_image_name} ...")
+        for cam in all_cameras:
+            if start_image_name in cam.image_name:
+                selected_view = cam
                 break
+        if not selected_view: print(f"Warning: {start_image_name} not found.")
 
+    if selected_view is None:
+        street_views = [c for c in all_cameras if c.image_type == "street"]
+        aerial_views = [c for c in all_cameras if c.image_type == "aerial"]
+        if street_views: selected_view = street_views[0]
+        elif aerial_views: selected_view = aerial_views[0]
+        elif all_cameras: selected_view = all_cameras[0]
+        else: return # No cameras
+
+    view = selected_view
+    print(f"Start Rendering View: {view.image_name}")
+
+    # 保存原始位姿
+    if isinstance(view.R, torch.Tensor): R_orig = view.R.cpu().numpy()
+    else: R_orig = view.R.copy()
+    if isinstance(view.T, torch.Tensor): T_orig = view.T.cpu().numpy()
+    else: T_orig = view.T.copy()
+    center_orig = -np.dot(R_orig.T, T_orig)
+
+    target_frame_time = 1.0 / TARGET_FPS
+
+    # [关键] 循环条件增加了 CLIENT_CONNECTED
+    while IS_RUNNING and CLIENT_CONNECTED:
+        loop_start_time = time.time()
+        try:
+            with STATE_LOCK:
+                curr_x, curr_y, curr_z = CAM_STATE['x'], CAM_STATE['y'], CAM_STATE['z']
+                curr_p, curr_yaw, curr_r = CAM_STATE['pitch'], CAM_STATE['yaw'], CAM_STATE['roll']
+            
+            # 计算新位姿
+            new_center = center_orig + np.array([curr_x, curr_y, curr_z], dtype=np.float32)
+            R_delta = get_rotation_matrix(curr_p, curr_yaw, curr_r)
+            R_new = np.dot(R_delta, R_orig)
+            T_new = -np.dot(R_new, new_center)
+            
+            view.R = R_new
+            view.T = T_new
+            view_matrix = getWorld2View2(view.R, view.T, view.trans, view.scale)
+            view.world_view_transform = torch.tensor(view_matrix).transpose(0, 1).cuda()
+            view.world_view_transform_inv = view.world_view_transform.inverse() # 确保有inverse属性
+            view.camera_center = view.world_view_transform_inv[3, :3]
+
+            # 渲染
+            render_pkg = getattr(renderer_modules, 'render')(view, gaussians, pipe, background)
+            rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
+            img_np = rendering.detach().permute(1, 2, 0).cpu().numpy()
+            
+            try:
+                img_queue.put_nowait(img_np)
+            except Full:
+                pass # Queue full, skip frame
+
+            elapsed = time.time() - loop_start_time
+            if elapsed < target_frame_time:
+                time.sleep(target_frame_time - elapsed)
+
+        except Exception as e:
+            print(f"Render Loop Error: {e}")
+            break
+    
+    print("\n[Render Loop] Stopped (Client Disconnected).")
+
+# ================= 主程序 =================
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument('-m', '--model_path', type=str, required=True)
@@ -282,8 +248,8 @@ if __name__ == "__main__":
     parser.add_argument("--explicit", action="store_true")
     parser.add_argument("--port", default=12345, type=int)
     parser.add_argument("--scale_factor", default=1.0, type=float)
-    # [新增] FPS 限制参数
-    parser.add_argument("--fps_limit", default=60, type=int, help="Target FPS limit to prevent queue overflow")
+    parser.add_argument("--start_view", default=None, type=str)
+    parser.add_argument("--fps_limit", default=60, type=int)
     args = parser.parse_args(sys.argv[1:])
 
     GLOBAL_SCALE_FACTOR = args.scale_factor
@@ -294,36 +260,52 @@ if __name__ == "__main__":
         lp, op, pp = parse_cfg(cfg)
         lp.model_path = args.model_path
 
-    HOST = '0.0.0.0'
-    print(f"Waiting for connection on {HOST}:{args.port}...")
-    print(f"Scale: {GLOBAL_SCALE_FACTOR}, Target FPS: {TARGET_FPS}")
+    # 1. 预加载场景（只做一次，避免重连时卡顿）
+    safe_state(args.quiet)
+    scene_data, gaussians_data, bg_data, r_mod = load_scene_once(lp, pp, args.iteration, args.ape, args.explicit)
 
+    # 2. 启动键盘监听（只启动一次，一直运行）
+    kb_thread = threading.Thread(target=keyboard_listener_thread, daemon=True)
+    kb_thread.start()
+
+    # 3. 网络服务主循环
+    HOST = '0.0.0.0'
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((HOST, args.port))
+    server_socket.listen(1)
+
+    print(f"\n[Server] Ready on port {args.port}. Waiting for connections...")
     
     try:
-        server_socket.bind((HOST, args.port))
-        server_socket.listen(1)
-        conn, addr = server_socket.accept()
-        print(f"Connected: {addr}")
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-        img_queue = Queue(maxsize=2)
-
-        kb_thread = threading.Thread(target=keyboard_listener_thread, daemon=True)
-        kb_thread.start()
-
-        sender = threading.Thread(target=socket_sender_thread, args=(conn, img_queue), daemon=True)
-        sender.start()
-
-        safe_state(args.quiet)
-        render_continuous_loop(img_queue, lp, pp, args.iteration, args.ape, args.explicit)
-
+        while IS_RUNNING: # 这里是一个死循环，不断接受新连接
+            print("\nWaiting for client...")
+            conn, addr = server_socket.accept()
+            print(f"[Server] Connected: {addr}")
+            
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            
+            # 初始化这次连接的状态
+            CLIENT_CONNECTED = True
+            img_queue = Queue(maxsize=2)
+            
+            # 启动发送线程
+            sender = threading.Thread(target=socket_sender_thread, args=(conn, img_queue), daemon=True)
+            sender.start()
+            
+            # 进入渲染循环（该函数会阻塞，直到 CLIENT_CONNECTED 变 False）
+            render_loop(scene_data, gaussians_data, bg_data, r_mod, pp, img_queue, args.start_view)
+            
+            # 清理连接
+            try:
+                conn.close()
+            except:
+                pass
+            print("[Server] Client session ended.")
+            
     except KeyboardInterrupt:
-        print("\nStopping...")
+        print("\nStopping Server...")
     finally:
         IS_RUNNING = False
-        restore_terminal_mode()
-        if 'conn' in locals(): conn.close()
         server_socket.close()
-        print("Server closed.")
+        restore_terminal_mode()

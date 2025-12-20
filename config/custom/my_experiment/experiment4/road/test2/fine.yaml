@@ -1,7 +1,7 @@
 
 # Model Parameters
 model_params: {
-    model_config: {'name': 'GaussianLoDModel', 'kwargs': {'fork': 2, 'gs_attr': '3D', 'color_attr': 'RGB', 'feat_dim': 32, 'view_dim': 3, 'appearance_dim': 0, 'n_offsets': 10, 'voxel_size': 0.001, 'render_mode': 'RGB+ED', 'standard_dist': 229.71656799316406, 'aerial_levels': 2, 'street_levels': 4}},
+    model_config: {'name': 'GaussianLoDModel', 'kwargs': {'fork': 2, 'gs_attr': '3D', 'color_attr': 'RGB', 'feat_dim': 32, 'view_dim': 0, 'appearance_dim': 0, 'n_offsets': 10, 'voxel_size': 0.001, 'render_mode': 'RGB+ED', 'standard_dist': 229.71656799316406, 'aerial_levels': 2, 'street_levels': 4}},
     pretrained_checkpoint: outputs/horizongs/real/road/coarse/point_cloud/iteration_60000,
     global_appearance: '',
     dataset_name: my_experiment,

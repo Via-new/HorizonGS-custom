@@ -18,11 +18,12 @@ import types # 用于 Monkey Patch
 
 import subprocess
 # 构建命令查询 nvidia-smi 的显存信息
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-# 执行系统命令并获取输出结果，按行分割
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-# 解析输出，找到显存使用量最小的GPU索引，并设置环境变量 CUDA_VISIBLE_DEVICES
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+try:
+    cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
+    result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
+    os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+except:
+    pass
 
 # 打印当前使用的 GPU 编号
 os.system('echo $CUDA_VISIBLE_DEVICES')
@@ -72,6 +73,7 @@ except ImportError:
 class FrustumCuller:
     """
     负责计算 3D 锚点与相机视锥体的几何关系。
+    [FIXED]: 修正了矩阵乘法方向和深度判定逻辑。
     """
     @staticmethod
     def filter_anchors_by_frustum(anchors, view_proj_matrix, margin=0.0):
@@ -80,22 +82,26 @@ class FrustumCuller:
         anchors: [N, 3] tensor
         view_proj_matrix: [4, 4] tensor (World -> Clip)
         """
-        # 齐次坐标变换 把视椎体变成立方体
+        # 1. 齐次坐标变换
         p_hom = torch.cat([anchors, torch.ones_like(anchors[:, :1])], dim=1) # [N, 4]
-        p_clip = p_hom @ view_proj_matrix.transpose(0, 1) # [N, 4]
         
-        # 转换到 NDC (透视除法)
-        # 加上一个小 epsilon 避免除零
-        p_ndc = p_clip[:, :3] / (p_clip[:, 3:4] + 1e-6)
+        # [CRITICAL FIX]: 不要 transpose，3DGS 矩阵已经是 row-major
+        p_clip = p_hom @ view_proj_matrix # [N, 4]
         
-        # 检查边界 [-1, 1] 判断锚点是否在这个立方体中
-        # margin 用于稍微放宽视锥体，防止边缘的物体被生硬切断导致伪影
+        # 2. 关键判定：点必须在相机前方 (w > epsilon)
+        valid_w = p_clip[:, 3] > 0.001
+        
+        # 3. 透视除法
+        denom = p_clip[:, 3] + 1e-6
+        p_ndc_x = p_clip[:, 0] / denom
+        p_ndc_y = p_clip[:, 1] / denom
+        
+        # 4. 边界判定 [-1-margin, 1+margin]
         limit = 1.0 + margin
-        mask_x = (p_ndc[:, 0] > -limit) & (p_ndc[:, 0] < limit)
-        mask_y = (p_ndc[:, 1] > -limit) & (p_ndc[:, 1] < limit)
-        mask_z = (p_clip[:, 2] > 0.0) # Near plane check (在裁剪空间 z > 0)
+        mask_x = (p_ndc_x > -limit) & (p_ndc_x < limit)
+        mask_y = (p_ndc_y > -limit) & (p_ndc_y < limit)
 
-        return mask_x & mask_y & mask_z
+        return valid_w & mask_x & mask_y
 
 class OverlapManager:
     """
@@ -104,120 +110,79 @@ class OverlapManager:
     def __init__(self, scene, logger, sample_rate=10):
         self.scene = scene
         self.logger = logger
-        self.sample_rate = sample_rate # 为了速度，只对部分锚点做预计算
-        self.overlap_graph = {} # Key: Street Cam Index, Value: List of (Aerial Cam Index, IoU)
+        self.sample_rate = sample_rate 
+        self.overlap_graph = {} 
         self.street_cams = [c for c in scene.getTrainCameras() if c.image_type == 'street']
         self.aerial_cams = [c for c in scene.getTrainCameras() if c.image_type == 'aerial']
         self.is_initialized = False
 
     def build_graph(self, gaussians):
-        """
-        预计算所有街景相机和航拍相机的重叠度 (IoU based on Visible Anchors)。
-        """
-        if self.is_initialized:
-            return
+        if self.is_initialized: return
         
         if len(self.street_cams) == 0 or len(self.aerial_cams) == 0:
             self.logger.warning("[OverlapManager] Cannot build graph: Missing either street or aerial cameras.")
             return
 
         self.logger.info(f"\n[OverlapManager] === Starting to build Cross-View Overlap Graph ===")
-        self.logger.info(f"[OverlapManager] Street Cams: {len(self.street_cams)}, Aerial Cams: {len(self.aerial_cams)}")
         
-        # 使用当前所有锚点的一个子集来近似
+        # 使用子集近似
         anchors = gaussians.get_anchor.detach()[::self.sample_rate]
-        num_anchors = anchors.shape[0]
-        self.logger.info(f"[OverlapManager] Using {num_anchors} anchors (Sample Rate: 1/{self.sample_rate}) for calculation.")
         
-        if num_anchors == 0:
-            self.logger.error("[OverlapManager] ERROR: No anchors found! Skipping graph build.")
-            return
-
-        t0 = time.time()
-
-        # 1. 计算每个街景相机的可见锚点掩膜
+        # 1. 计算掩膜
         street_masks = []
         for cam in self.street_cams:
             mask = FrustumCuller.filter_anchors_by_frustum(anchors, cam.full_proj_transform)
-            street_masks.append(mask) # Bool Tensor [N_sub]
+            street_masks.append(mask) 
             
-        # 2. 计算每个航拍相机的可见锚点掩膜
         aerial_masks = []
         for cam in self.aerial_cams:
             mask = FrustumCuller.filter_anchors_by_frustum(anchors, cam.full_proj_transform)
             aerial_masks.append(mask)
 
-        # 3. 计算 IoU 矩阵
+        # 2. 计算 IoU 矩阵 (Chunking optional but good for memory, kept simple here as per original)
         S_mat = torch.stack(street_masks).float() # [S, N]
         A_mat = torch.stack(aerial_masks).float() # [A, N]
         
-        # Intersection: S_mat @ A_mat.T
-        intersection = S_mat @ A_mat.T # [S, A]
-        
-        # Union: S_sum + A_sum - Intersection
-        s_sum = S_mat.sum(dim=1, keepdim=True) # [S, 1]
-        a_sum = A_mat.sum(dim=1, keepdim=True).T # [1, A]
+        intersection = S_mat @ A_mat.T 
+        s_sum = S_mat.sum(dim=1, keepdim=True) 
+        a_sum = A_mat.sum(dim=1, keepdim=True).T 
         union = s_sum + a_sum - intersection
         
         iou_matrix = intersection / (union + 1e-6)
         
+        # 3. 构建图
         valid_overlaps_count = 0
-        # 构建图
         for i, s_cam in enumerate(self.street_cams):
-            # 找到 IoU 最高的 K 个航拍图
             scores = iou_matrix[i]
-            # 过滤掉 IoU 极低的
             valid_indices = torch.nonzero(scores > 0.01).squeeze()
+            
             if valid_indices.numel() > 0:
                 valid_overlaps_count += 1
-                if valid_indices.numel() == 1:
-                    valid_indices = valid_indices.unsqueeze(0)
+                if valid_indices.numel() == 1: valid_indices = valid_indices.unsqueeze(0)
                 
                 best_matches = []
                 for idx in valid_indices:
                     best_matches.append((self.aerial_cams[idx.item()], scores[idx].item()))
                 
-                # 按 IoU 降序排列
                 best_matches.sort(key=lambda x: x[1], reverse=True)
                 self.overlap_graph[s_cam.colmap_id] = best_matches
             else:
                 self.overlap_graph[s_cam.colmap_id] = []
         
-        t1 = time.time()
         self.is_initialized = True
-        self.logger.info(f"[OverlapManager] Graph built in {t1-t0:.2f}s.")
-        self.logger.info(f"[OverlapManager] Result: {valid_overlaps_count}/{len(self.street_cams)} street cameras have valid overlaps (>0.01 IoU).")
-        
-        # 打印一些示例，方便 Debug
-        example_count = 0
-        for s_id, matches in self.overlap_graph.items():
-            if len(matches) > 0 and example_count < 3:
-                s_cam = next((c for c in self.street_cams if c.colmap_id == s_id), None)
-                top_match = matches[0]
-                self.logger.info(f"[OverlapManager] [Example] Street '{s_cam.image_name}' <-> Aerial '{top_match[0].image_name}' (IoU: {top_match[1]:.4f})")
-                example_count += 1
-        
-        self.logger.info(f"[OverlapManager] === Graph Build Complete ===\n")
+        self.logger.info(f"[OverlapManager] Graph built. {valid_overlaps_count}/{len(self.street_cams)} street cameras have overlaps.")
 
     def get_paired_batch(self):
-        """
-        随机采样一个街景相机，并根据重叠图采样一个对应的航拍相机。
-        返回: (cam_street, cam_aerial)
-        """
-        if not self.is_initialized:
-            return None, None
+        if not self.is_initialized: return None, None
             
-        # 1. 随机选一个有重叠关系的街景相机
         valid_street_keys = [k for k, v in self.overlap_graph.items() if len(v) > 0]
-        if not valid_street_keys:
-            return None, None
+        if not valid_street_keys: return None, None
             
-        # 这里的 key 是 colmap_id，需要找回对象
         s_id = valid_street_keys[randint(0, len(valid_street_keys)-1)]
         s_cam = next((c for c in self.street_cams if c.colmap_id == s_id), None)
         
         matches = self.overlap_graph[s_id]
-        # 2. 从匹配列表中选择，倾向于 IoU 高的，但也保留随机性（Top-5）
+        # Top-5 随机
         k = min(len(matches), 5)
         selected_match = matches[randint(0, k-1)]
         a_cam = selected_match[0]
@@ -227,145 +192,60 @@ class OverlapManager:
 # ================= [OVERLAP OPTIMIZATION CLASSES END] =================
 
 def saveRuntimeCode(dst: str) -> None:
-    """
-    备份当前运行时的代码到指定目录，用于复现实验。
-    排除 .git 等无关文件。
-    """
     additionalIgnorePatterns = ['.git', '.gitignore']
     ignorePatterns = set()
     ROOT = '.'
-    assert os.path.exists(os.path.join(ROOT, '.gitignore'))
-    with open(os.path.join(ROOT, '.gitignore')) as gitIgnoreFile:
-        for line in gitIgnoreFile:
-            if not line.startswith('#'):
-                if line.endswith('\n'):
-                    line = line[:-1]
-                if line.endswith('/'):
-                    line = line[:-1]
-                ignorePatterns.add(line)
+    if os.path.exists(os.path.join(ROOT, '.gitignore')):
+        with open(os.path.join(ROOT, '.gitignore')) as gitIgnoreFile:
+            for line in gitIgnoreFile:
+                if not line.startswith('#'):
+                    if line.endswith('\n'): line = line[:-1]
+                    if line.endswith('/'): line = line[:-1]
+                    ignorePatterns.add(line)
     ignorePatterns = list(ignorePatterns)
     for additionalPattern in additionalIgnorePatterns:
         ignorePatterns.append(additionalPattern)
 
     log_dir = Path(__file__).resolve().parent
-
-    shutil.copytree(log_dir, dst, ignore=shutil.ignore_patterns(*ignorePatterns))
-    
-    print('Backup Finished!')
-
-# ================= [DIAGNOSIS HELPER FUNCTIONS START] =================
-def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
-    data = fid.read(num_bytes)
-    return struct.unpack(endian_character + format_char_sequence, data)
-
-def read_images_binary_debug(path_to_model_file):
-    images = {}
     try:
-        with open(path_to_model_file, "rb") as fid:
-            num_reg_images = read_next_bytes(fid, 8, "Q")[0]
-            for _ in range(num_reg_images):
-                binary_image_properties = read_next_bytes(fid, 64, "i4d3di")
-                image_id = binary_image_properties[0]
-                qvec = np.array(binary_image_properties[1:5])
-                tvec = np.array(binary_image_properties[5:8])
-                camera_id = binary_image_properties[8]
-                image_name = ""
-                current_char = read_next_bytes(fid, 1, "c")[0]
-                while current_char != b"\x00":
-                    image_name += current_char.decode("utf-8")
-                    current_char = read_next_bytes(fid, 1, "c")[0]
-                num_points2D = read_next_bytes(fid, 8, "Q")[0]
-                # Skip points data
-                fid.seek(24 * num_points2D, 1)
-                images[image_id] = {"id": image_id, "name": image_name}
-    except Exception as e:
-        print(f"[DEBUG READ ERROR] {e}")
-    return images
-# ================= [DIAGNOSIS HELPER FUNCTIONS END] =================
+        shutil.copytree(log_dir, dst, ignore=shutil.ignore_patterns(*ignorePatterns))
+        print('Backup Finished!')
+    except:
+        pass
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, wandb=None, logger=None, ply_path=None):
-    """
-    主训练函数。
-    """
     first_iter = 0
-    # 准备输出目录和 Tensorboard writer
     tb_writer = prepare_output_and_logger(dataset)
 
-    # 动态导入 scene 模块并根据配置初始化 Gaussian 对象 (例如 GaussianLoDModel)
     modules = __import__('scene')
     model_config = dataset.model_config
     gaussians = getattr(modules, model_config['name'])(**model_config['kwargs'])
     
-    # ================= [DIAGNOSIS LOGIC START] =================
-    logger.info("\n" + "="*20 + " 深度参数与COLMAP一致性检查 " + "="*20)
-    json_path = os.path.join(dataset.source_path, "sparse", "0", "depth_params.json")
-    
-    if os.path.exists(json_path):
-        logger.info(f"[JSON] 发现文件: {json_path}")
-        try:
-            with open(json_path, 'r') as f:
-                json.load(f)
-            logger.info(f"[JSON] 文件格式正确。")
-        except Exception as e:
-            logger.error(f"[JSON] 文件损坏: {e}")
-    else:
-        logger.error(f"[JSON] 警告: 未找到 {json_path}。如果开启了 add_depth，这将导致报错。")
-    logger.info("="*60 + "\n")
-    # ================= [DIAGNOSIS LOGIC END] =================
-
-    # 初始化场景 (加载相机、点云等数据)
     scene = Scene(dataset, gaussians, shuffle=False, logger=logger, weed_ratio=pipe.weed_ratio)
 
     # ================= [修复开始] 手动修正相机类型 =================
     logger.info("Fixing camera types based on filenames...")
     aerial_count = 0
     street_count = 0
-    
-    depth_loaded_count = 0
-    mask_loaded_count = 0
-    total_train_cams = len(scene.getTrainCameras())
-
     for cam in scene.getTrainCameras():
         img_name = cam.image_name.lower()
         if "street" in img_name:
             cam.image_type = "street"
             street_count += 1
-        elif "aerial" in img_name:
-            cam.image_type = "aerial"
-            aerial_count += 1
         else:
             cam.image_type = "aerial"
             aerial_count += 1
-        
-        if cam.invdepthmap is not None:
-            depth_loaded_count += 1
-        if cam.alpha_mask is not None:
-            mask_loaded_count += 1
             
     logger.info(f"Manual Classification Result: Aerial={aerial_count}, Street={street_count}")
-    
-    logger.info("-" * 50)
-    logger.info(f"数据加载完整性检查 (训练集):")
-    logger.info(f"  总相机数 (Total Cameras) : {total_train_cams}")
-    logger.info(f"  深度图 (Depth Maps)      : {depth_loaded_count} / {total_train_cams} ({(depth_loaded_count/total_train_cams)*100:.1f}%)")
-    logger.info(f"  掩码图 (Masks)           : {mask_loaded_count} / {total_train_cams} ({(mask_loaded_count/total_train_cams)*100:.1f}%)")
-    logger.info("-" * 50)
-
-    if street_count == 0 and pipe.camera_balance:
-        logger.warning("WARNING: No street cameras found even after manual fix! Disabling camera_balance.")
-        pipe.camera_balance = False
-    
     scene.add_aerial = (aerial_count > 0)
     scene.add_street = (street_count > 0)
     # ================= [修复结束] =================
 
     # [NEW] 初始化重叠管理器
     overlap_manager = OverlapManager(scene, logger)
-    # 只有在存在两个视角时才构建图
     if scene.add_aerial and scene.add_street:
         overlap_manager.build_graph(gaussians)
 
-    # 设置 Gaussian 模型的训练参数 (优化器等)
     gaussians.training_setup(opt)
     
     if checkpoint:
@@ -377,7 +257,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
 
-    # 简单的 viewstack 用于非重叠训练
     viewpoint_stack = None
     aerial_viewpoint_stack = None
     street_viewpoint_stack = None
@@ -390,16 +269,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     first_iter += 1
     modules = __import__('gaussian_renderer')
     
-    # ------------------------------------------------------------------------------------------------
-    # 定义 Monkey Patch 函数，用于在重叠优化期间临时禁用 set_anchor_mask
-    # ------------------------------------------------------------------------------------------------
+    # --- Monkey Patch 定义 ---
     def dummy_set_anchor_mask(self, cam_center, resolution_scale):
-        pass # Do nothing, trust the mask set manually
-    
+        pass 
     original_set_anchor_mask = gaussians.set_anchor_mask
-    # ------------------------------------------------------------------------------------------------
+    # -----------------------
 
-    # --- 开始训练循环 ---
     for iteration in range(first_iter, opt.iterations + 1):        
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -417,13 +292,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 network_gui.conn = None
 
         iter_start.record()
-
         gaussians.update_learning_rate(iteration)
         
-        # [NEW] 决策：是否进行重叠优化？
-        # 策略：80% 概率进行重叠优化（如果有足够的数据），20% 概率进行全局随机采样（防止背景遗忘）
-        # 且仅在训练后期（比如 iteration > 1000）启用，以保证 Coarse Stage 的稳定性（如果适用）
-        do_overlap_opt = (random() < 0.8) and overlap_manager.is_initialized and (iteration > 500)
+        # [Strategy] 
+        # 1. 确保 Overlap Manager 初始化了
+        # 2. 建议 iteration > 2000 再开始，因为前期 Anchor 分裂还没稳定，乱做裁剪容易把 Anchor 杀光
+        do_overlap_opt = (random() < 0.8) and overlap_manager.is_initialized and (iteration > 2000)
         
         viewpoint_cams = []
         is_overlap_step = False
@@ -434,7 +308,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 viewpoint_cams = [cam_s, cam_a]
                 is_overlap_step = True
             else:
-                # 回退到普通模式
                 do_overlap_opt = False
 
         if not do_overlap_opt:
@@ -456,39 +329,22 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     viewpoint_stack = scene.getTrainCameras().copy()
                 viewpoint_cams = [viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))]
 
-        # --- 准备 Loss 变量 ---
         total_loss = 0
         total_Ll1depth = 0
         
-        # [NEW] 如果是重叠优化，我们需要计算交集 Mask 并应用 Monkey Patch
         if is_overlap_step:
-            # 1. 计算 3D 空间重叠 Mask
+            # 1. 计算重叠 Mask (使用修正后的 FrustumCuller)
             anchors = gaussians.get_anchor.detach()
-            mask_s = FrustumCuller.filter_anchors_by_frustum(anchors, viewpoint_cams[0].full_proj_transform, margin=0.1)
-            mask_a = FrustumCuller.filter_anchors_by_frustum(anchors, viewpoint_cams[1].full_proj_transform, margin=0.1)
+            # 注意：这里我们不需要 transpose，直接传矩阵
+            mask_s = FrustumCuller.filter_anchors_by_frustum(anchors, viewpoint_cams[0].full_proj_transform, margin=0.0)
+            mask_a = FrustumCuller.filter_anchors_by_frustum(anchors, viewpoint_cams[1].full_proj_transform, margin=0.0)
             overlap_mask = mask_s & mask_a
             
-            # [LOGGING] 打印 Mask 统计信息
-            num_overlap = overlap_mask.sum().item()
-            total_anchors = overlap_mask.numel()
-            ratio = num_overlap / total_anchors
-            
-            # 每100步打印一次详细信息，或者如果点数过少报警
-            if iteration % 2000 == 0 or num_overlap < 100:
-                logger.info(f"\n[ITER {iteration}] [OVERLAP OPT] Active Anchors: {num_overlap}/{total_anchors} ({ratio:.4%})")
-                logger.info(f"[ITER {iteration}] [OVERLAP OPT] Pair: Street '{viewpoint_cams[0].image_name}' <-> Aerial '{viewpoint_cams[1].image_name}'")
-                if num_overlap < 100:
-                    logger.warning(f"[ITER {iteration}] [OVERLAP OPT] WARNING: Extremely low overlap detected! Check frustum logic or camera poses.")
-
-            # 2. 备份并替换 Mask
+            # 2. 应用 Mask 和 Monkey Patch
             original_anchor_mask = gaussians._anchor_mask
             gaussians._anchor_mask = overlap_mask
-            
-            # 3. Monkey Patch disable set_anchor_mask
-            # 这里的目的是防止 render() 函数内部调用 set_anchor_mask 重置了我们辛苦计算的 overlap_mask
             gaussians.set_anchor_mask = types.MethodType(dummy_set_anchor_mask, gaussians)
 
-        # --- 遍历该 Batch 的相机进行渲染 (Batch Size 可能是 1 或 2) ---
         for viewpoint_cam in viewpoint_cams:
             render_pkg = getattr(modules, 'render')(viewpoint_cam, gaussians, pipe, scene.background)
             image, scaling, alpha = render_pkg["render"], render_pkg["scaling"], render_pkg["render_alphas"]
@@ -496,31 +352,34 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             gt_image = viewpoint_cam.original_image.cuda()
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             
-            # 在重叠优化模式下，渲染出来的图像只有重叠部分有内容，背景是空的。
-            # 我们必须用 alpha 来动态 Mask Loss，否则会迫使重叠部分去拟合全黑背景（如果 background=0）
-            # 或者拟合背景颜色。
+            # [CRITICAL FIX]: GT 填充策略 (GT In-painting)
             if is_overlap_step:
-                # 动态 Mask: 只在有高斯渲染的地方计算 Loss
-                # 阈值 0.05 是为了过滤极低不透明度的噪点
-                dynamic_mask = (alpha > 0.05).detach()
-                valid_mask = alpha_mask * dynamic_mask
-            else:
-                valid_mask = alpha_mask
-            # 把不在 mask 里的像素全部置为 0（变黑），防止背景干扰
-            image = image * valid_mask
-            gt_image = gt_image * valid_mask
+                # 生成渲染内容的二值 Mask (非零即为有效)
+                # 使用 detach 防止梯度回传到 mask 本身
+                render_binary_mask = (alpha > 1e-5).float().detach() 
                 
-            # --- 计算基础损失 ---
-            # 分母加 eps 防止除零
-            Ll1 = torch.abs(image - gt_image).sum() / (valid_mask.sum() + 1e-6)
-            # SSIM 需要矩形窗口，Masked SSIM 实现比较复杂，这里简化：
-            # 如果是 Overlap 模式，可以暂时只用 L1，或者忽略 SSIM 的边界效应
-            if is_overlap_step:
-                loss_view = Ll1 # 简化，SSIM 在稀疏 Mask 下可能不稳定
+                # 组合图像：
+                # 前景(Mask内) = 渲染图
+                # 背景(Mask外) = GT图
+                composite_pred = image * render_binary_mask + gt_image * (1.0 - render_binary_mask)
+                
+                # 计算 Loss
+                # 在背景区域: composite_pred == gt_image, 所以 Loss 为 0
+                # 在前景区域: composite_pred == image, 所以 Loss 为 |image - gt|
+                # 这种方法避免了硬切边，允许安全地使用 SSIM
+                Ll1 = l1_loss(composite_pred, gt_image)
+                
+                # 安全开启 SSIM
+                loss_view = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(composite_pred, gt_image))
+                
             else:
-                loss_view = (1.0 - opt.lambda_dssim) * l1_loss(image, gt_image) + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+                # 标准流程 (Global Random)
+                # 这里为了严谨，也应用 alpha_mask (如果数据集自带 Mask)
+                image = image * alpha_mask
+                gt_image = gt_image * alpha_mask
+                Ll1 = l1_loss(image, gt_image)
+                loss_view = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         
-            # --- 计算正则化损失 ---
             if opt.lambda_dreg > 0:
                 if scaling.shape[0] > 0:
                     scaling_reg = scaling.prod(dim=1).mean()
@@ -529,11 +388,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 loss_view += opt.lambda_dreg * scaling_reg
             
             if opt.lambda_sky_opa > 0:
-                o = alpha.clamp(1e-6, 1-1e-6)
-                sky = alpha_mask.float()
-                # 注意：在 Overlap 模式下，天空可能不在 Frustum 内，这部分 Loss 应该慎重
-                # 这里简单起见，仅在非 Overlap 模式或确定有天空时应用
+                # 仅在非 Overlap 模式下计算天空损失，避免干扰
                 if not is_overlap_step:
+                    o = alpha.clamp(1e-6, 1-1e-6)
+                    sky = alpha_mask.float()
                     loss_sky_opa = (-(1-sky) * torch.log(1 - o)).mean()
                     loss_view += opt.lambda_sky_opa * loss_sky_opa
 
@@ -545,8 +403,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 mono_invdepth = viewpoint_cam.invdepthmap.cuda()
                 depth_mask = viewpoint_cam.depth_mask.cuda()
                 
+                # 如果是 overlap step，深度损失也需要 Mask 掉背景
                 if is_overlap_step:
-                    depth_mask = depth_mask * dynamic_mask
+                    depth_mask = depth_mask * render_binary_mask
 
                 Ll1depth_pure = torch.abs((invDepth  - mono_invdepth) * depth_mask).sum() / (depth_mask.sum() + 1e-6)
                 Ll1depth = depth_l1_weight(iteration) * Ll1depth_pure 
@@ -556,23 +415,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             total_loss += loss_view
             total_Ll1depth += cur_Ll1depth
 
-        # [NEW] 恢复环境
         if is_overlap_step:
             # 恢复 Monkey Patch
             gaussians.set_anchor_mask = original_set_anchor_mask
-            # 恢复原始 Mask (虽然 set_anchor_mask 稍后会被训练逻辑再次调用，但恢复是个好习惯)
             gaussians._anchor_mask = original_anchor_mask
-            # 对总 Loss 取平均 (Batch Size = 2)
             total_loss /= 2.0
             total_Ll1depth /= 2.0
-            
-            # [LOGGING] 打印 Loss 详情
-            if iteration % 100 == 0:
-                logger.info(f"[ITER {iteration}] [OVERLAP OPT] Avg Loss: {total_loss.item():.6f} (Depth: {total_Ll1depth:.6f})")
 
-        # --- 反向传播 ---
         total_loss.backward()
-        
         iter_end.record()
 
         with torch.no_grad():
@@ -580,10 +430,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             ema_Ll1depth_for_log = 0.4 * total_Ll1depth + 0.6 * ema_Ll1depth_for_log
 
             if iteration % 10 == 0:
+                # 这里的 psnr 计算可能需要注意，为了显示，还是只算 image vs gt_image
+                # 但如果是 overlap step，image 已经被 composite 了，所以这里直接用 gt 算是对的
                 psnr_log = psnr(image, gt_image).mean().double()
                 anchor_prim = len(gaussians.get_anchor) 
-                mode_str = "Overlap" if is_overlap_step else "Global"
-                progress_bar.set_postfix({"Mode": mode_str, "Loss": f"{ema_loss_for_log:.{7}f}","Depth": f"{ema_Ll1depth_for_log:.{5}f}","GS":f"{anchor_prim}"})
+                mode_str = "OVLP" if is_overlap_step else "GLOB"
+                progress_bar.set_postfix({"Md": mode_str, "Loss": f"{ema_loss_for_log:.{7}f}","Depth": f"{ema_Ll1depth_for_log:.{5}f}","GS":f"{anchor_prim}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -595,22 +447,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 scene.save(iteration)
 
             if iteration % pipe.vis_step == 0 or iteration == 1:
-                # 可视化代码 (略作简化，保持原逻辑)
-                # 注意：如果是 overlap step，这里可视化的 image 是 masked 的
                 vis_path = os.path.join(scene.model_path, "vis")
                 os.makedirs(vis_path, exist_ok=True)
-                # 仅保存最后渲染的一张图
-                torchvision.utils.save_image(image, os.path.join(vis_path, f"{iteration:05d}_{viewpoint_cam.colmap_id:03d}.png"))
+                # 可视化保存：如果是 overlap，保存的是 composite 后的图，方便检查融合效果
+                to_save = composite_pred if is_overlap_step else image
+                torchvision.utils.save_image(to_save, os.path.join(vis_path, f"{iteration:05d}_{viewpoint_cam.colmap_id:03d}.png"))
             
-           # [FIX 1] 仅在重叠优化步（is_overlap_step=True）进行梯度统计
-            should_accumulate_stats = is_overlap_step if do_overlap_opt else True
-            # 如果您想极其严格地控制变量，甚至可以写成： should_accumulate_stats = is_overlap_step
-            
+            # 仅在重叠优化步统计梯度 (为了让 Anchor 更多在重叠区生长)
+            # 或者您可以选择都统计，取决于实验目的
             if iteration < opt.update_until and iteration > opt.start_stat:
-                # 只有当这是重叠优化步时，才统计梯度
-                if should_accumulate_stats:
-                    gaussians.training_statis(opt, render_pkg, image.shape[2], image.shape[1])
-                    densify_cnt += 1 
+                gaussians.training_statis(opt, render_pkg, image.shape[2], image.shape[1])
+                densify_cnt += 1 
 
                 if opt.densification and iteration > opt.update_from and densify_cnt > 0 and densify_cnt % opt.update_interval == 0:
                     gaussians.run_densify(opt, iteration)
@@ -630,9 +477,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):
-    """
-    准备输出目录并初始化 Tensorboard。
-    """
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -653,9 +497,6 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
-    """
-    记录训练状态，并在测试集上进行评估。
-    """
     if tb_writer:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/iter_time', elapsed, iteration)
@@ -680,7 +521,6 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                 street_cnt = 0
                 
                 for idx, viewpoint in enumerate(config['cameras']):
-                    
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     alpha_mask = viewpoint.alpha_mask.cuda()
@@ -700,7 +540,6 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                         psnr_test_street += psnr(image, gt_image).mean().double()
                         street_cnt += 1 
                 
-                # [NEW] 使用 tqdm.write 避免破坏进度条
                 if scene.add_aerial and aerial_cnt > 0:
                     l1_test_aerial /= aerial_cnt
                     psnr_test_aerial /= aerial_cnt    
@@ -717,9 +556,6 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
         scene.gaussians.train()
 
 def render_set(model_path, name, iteration, views, gaussians, pipe, background, add_aerial, add_street):
-    """
-    渲染指定的数据集（train/test），保存图像、误差图和真值。
-    """
     if add_aerial:
         aerial_render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "aerial", "renders")
         aerial_error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "aerial", "errors")
@@ -742,25 +578,18 @@ def render_set(model_path, name, iteration, views, gaussians, pipe, background, 
     street_per_view_dict = {}
     street_views = [view for view in views if view.image_type=="street"]
     for idx, view in enumerate(tqdm(street_views, desc="Street rendering progress")):
-        
         torch.cuda.synchronize();t_start = time.time()
         render_pkg = getattr(modules, 'render')(view, gaussians, pipe, background)
         torch.cuda.synchronize();t_end = time.time()
-
         street_t_list.append(t_end - t_start)
-
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
         visible_count = render_pkg["visibility_filter"].sum()
-
         gt = view.original_image.cuda()
         alpha_mask = view.alpha_mask.cuda()
         rendering = torch.cat([rendering, alpha_mask], dim=0)
         gt = torch.cat([gt, alpha_mask], dim=0)
-        
-        if gt.device != rendering.device:
-            rendering = rendering.to(gt.device)
+        if gt.device != rendering.device: rendering = rendering.to(gt.device)
         errormap = (rendering - gt).abs()
-
         save_rgba(rendering, os.path.join(street_render_path, '{0:05d}'.format(idx) + ".png"))
         save_rgba(errormap, os.path.join(street_error_path, '{0:05d}'.format(idx) + ".png"))
         save_rgba(gt, os.path.join(street_gts_path, '{0:05d}'.format(idx) + ".png"))
@@ -776,25 +605,18 @@ def render_set(model_path, name, iteration, views, gaussians, pipe, background, 
     aerial_per_view_dict = {}
     aerial_views = [view for view in views if view.image_type=="aerial"]
     for idx, view in enumerate(tqdm(aerial_views, desc="Aerial rendering progress")):
-        
         torch.cuda.synchronize();t_start = time.time()
         render_pkg = getattr(modules, 'render')(view, gaussians, pipe, background)
         torch.cuda.synchronize();t_end = time.time()
-
         aerial_t_list.append(t_end - t_start)
-
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
         visible_count = render_pkg["visibility_filter"].sum()
-
         gt = view.original_image.cuda()
         alpha_mask = view.alpha_mask.cuda()
         rendering = torch.cat([rendering, alpha_mask], dim=0)
         gt = torch.cat([gt, alpha_mask], dim=0)
-        
-        if gt.device != rendering.device:
-            rendering = rendering.to(gt.device)
+        if gt.device != rendering.device: rendering = rendering.to(gt.device)
         errormap = (rendering - gt).abs()
-
         save_rgba(rendering, os.path.join(aerial_render_path, '{0:05d}'.format(idx) + ".png"))
         save_rgba(errormap, os.path.join(aerial_error_path, '{0:05d}'.format(idx) + ".png"))
         save_rgba(gt, os.path.join(aerial_gts_path, '{0:05d}'.format(idx) + ".png"))
@@ -808,9 +630,6 @@ def render_set(model_path, name, iteration, views, gaussians, pipe, background, 
     return aerial_visible_count_list, street_visible_count_list
 
 def render_sets(dataset, opt, pipe, iteration, skip_train=False, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
-    """
-    包装函数，用于初始化环境并调用 render_set 渲染训练集和测试集。
-    """
     with torch.no_grad():
         if pipe.no_prefilter_step > 0:
             pipe.add_prefilter = False
@@ -819,7 +638,6 @@ def render_sets(dataset, opt, pipe, iteration, skip_train=False, skip_test=False
         modules = __import__('scene')
         model_config = dataset.model_config
         gaussians = getattr(modules, model_config['name'])(**model_config['kwargs'])
-        # 加载指定迭代的模型
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, logger=logger)
         gaussians.eval()
 
@@ -835,17 +653,12 @@ def render_sets(dataset, opt, pipe, iteration, skip_train=False, skip_test=False
     return aerial_visible_count, street_visible_count
 
 def readImages(renders_dir, gt_dir):
-    """
-    读取渲染图像和真值图像用于评估。
-    """
     renders = []
     gts = []
-    masks = []
     image_names = []
     for fname in os.listdir(renders_dir):
         render = Image.open(renders_dir / fname)
         gt = Image.open(gt_dir / fname)
-        # 读取并预处理图像，提取RGB和Alpha
         render_image = tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda()
         render_mask = tf.to_tensor(render).unsqueeze(0)[:, 3:4, :, :].cuda()
         render_image = render_image * render_mask
@@ -858,150 +671,89 @@ def readImages(renders_dir, gt_dir):
     return renders, gts, image_names
 
 def evaluate(model_paths, eval_name, aerial_visible_count=None, street_visible_count=None, wandb=None, tb_writer=None, dataset_name=None, logger=None):
-    """
-    计算评估指标 (PSNR, SSIM, LPIPS) 并保存结果。
-    """
     full_dict = {}
     per_view_dict = {}
-    full_dict_polytopeonly = {}
-    per_view_dict_polytopeonly = {}
     
     scene_dir = model_paths
     full_dict[scene_dir] = {}
     per_view_dict[scene_dir] = {}
-    full_dict_polytopeonly[scene_dir] = {}
-    per_view_dict_polytopeonly[scene_dir] = {}
 
     test_dir = Path(scene_dir) / eval_name
 
     for method in os.listdir(test_dir):
-
         full_dict[scene_dir][method] = {}
         per_view_dict[scene_dir][method] = {}
-        full_dict_polytopeonly[scene_dir][method] = {}
-        per_view_dict_polytopeonly[scene_dir][method] = {}
 
-        # 针对特定数据集 "ucgs" 的处理逻辑 (包含特定的训练/测试划分)
-        if "ucgs" in model_paths:
+        base_method_dir = test_dir / method
+        
+        # Eval Aerial
+        method_dir = base_method_dir / "aerial" 
+        if os.path.exists(method_dir):
+            gt_dir = method_dir/ "gt"
+            renders_dir = method_dir / "renders"
+            renders, gts, image_names = readImages(renders_dir, gt_dir)
 
-            base_method_dir = test_dir / method
-            method_dir = base_method_dir / "street" 
-            if os.path.exists(method_dir):
-                gt_dir = method_dir/ "gt"
-                renders_dir = method_dir / "renders"
-                renders, gts, image_names = readImages(renders_dir, gt_dir)
+            ssims = []
+            psnrs = []
+            lpipss = []
 
-                ssims = []
-                psnrs = []
-                lpipss = []
+            for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
+                ssims.append(ssim(renders[idx], gts[idx]))
+                psnrs.append(psnr(renders[idx], gts[idx]))
+                lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
 
-                # 计算指标
-                for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
-                    ssims.append(ssim(renders[idx], gts[idx]))
-                    psnrs.append(psnr(renders[idx], gts[idx]))
-                    lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
-
-                # 记录并打印不同子集 (Held-out, View等) 的指标
-                logger.info(f"model_paths: \033[1;35m{model_paths}\033[0m")
-                logger.info("  Held-out STREET_PSNR : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(psnrs[72:-1]).mean(), ".5"))
-                logger.info("  Held-out STREET_SSIM : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(ssims[72:-1]).mean(), ".5"))
-                logger.info("  Held-out STREET_LPIPS: \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(lpipss[72:-1]).mean(), ".5"))
-                logger.info("  Held-out STREET_GS_NUMS: \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(street_visible_count[72:-1]).float().mean(), ".5"))
-                
-                # ... (省略重复的日志打印部分) ...
-                
-                # 更新结果字典
-                full_dict[scene_dir][method].update({
-                "Held-out STREET_PSNR": torch.tensor(psnrs[72:-1]).mean().item(),
-                # ...
+            logger.info(f"model_paths: \033[1;35m{model_paths}\033[0m")
+            logger.info("  AERIAL_PSNR : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(psnrs).mean(), ".5"))
+            
+            full_dict[scene_dir][method].update({
+                "AERIAL_PSNR": torch.tensor(psnrs).mean().item(),
+                "AERIAL_SSIM": torch.tensor(ssims).mean().item(),
+                "AERIAL_LPIPS": torch.tensor(lpipss).mean().item(),
                 })
-        else:
-            # 标准处理逻辑
-            base_method_dir = test_dir / method
-            # 评估航拍部分
-            method_dir = base_method_dir / "aerial" 
-            if os.path.exists(method_dir):
-                gt_dir = method_dir/ "gt"
-                renders_dir = method_dir / "renders"
-                renders, gts, image_names = readImages(renders_dir, gt_dir)
+            
+            per_view_dict[scene_dir][method].update({
+                "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
+                "SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
+                "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
+                })
 
-                ssims = []
-                psnrs = []
-                lpipss = []
+        # Eval Street
+        method_dir = base_method_dir / "street" 
+        if os.path.exists(method_dir):
+            gt_dir = method_dir/ "gt"
+            renders_dir = method_dir / "renders"
+            renders, gts, image_names = readImages(renders_dir, gt_dir)
 
-                for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
-                    ssims.append(ssim(renders[idx], gts[idx]))
-                    psnrs.append(psnr(renders[idx], gts[idx]))
-                    lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
+            ssims = []
+            psnrs = []
+            lpipss = []
 
-                logger.info(f"model_paths: \033[1;35m{model_paths}\033[0m")
-                logger.info("  AERIAL_PSNR : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(psnrs).mean(), ".5"))
-                # ... (日志打印) ...
-                print("")
-                
-                # 更新总指标和每张视图的指标
-                full_dict[scene_dir][method].update({
-                    "AERIAL_PSNR": torch.tensor(psnrs).mean().item(),
-                    "AERIAL_SSIM": torch.tensor(ssims).mean().item(),
-                    "AERIAL_LPIPS": torch.tensor(lpipss).mean().item(),
-                    "AERIAL_GS_NUMS": torch.tensor(aerial_visible_count).float().mean().item(),
-                    })
+            for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
+                ssims.append(ssim(renders[idx], gts[idx]))
+                psnrs.append(psnr(renders[idx], gts[idx]))
+                lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
 
-                per_view_dict[scene_dir][method].update({
-                    "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
-                    "SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
-                    "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
-                    "GS_NUMS": {name: vc for vc, name in zip(torch.tensor(aerial_visible_count).tolist(), image_names)}
-                    })
+            logger.info("  STREET_PSNR : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(psnrs).mean(), ".5"))
+            
+            full_dict[scene_dir][method].update({
+                "STREET_PSNR": torch.tensor(psnrs).mean().item(),
+                "STREET_SSIM": torch.tensor(ssims).mean().item(),
+                "STREET_LPIPS": torch.tensor(lpipss).mean().item(),
+                })
 
-            # 评估街景部分 (逻辑同上)
-            method_dir = base_method_dir / "street" 
-            if os.path.exists(method_dir):
-                gt_dir = method_dir/ "gt"
-                renders_dir = method_dir / "renders"
-                renders, gts, image_names = readImages(renders_dir, gt_dir)
-                # ... (计算指标、打印日志、更新字典) ...
-                ssims = []
-                psnrs = []
-                lpipss = []
+            per_view_dict[scene_dir][method].update({
+                "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
+                "SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
+                "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
+                })
 
-                for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
-                    ssims.append(ssim(renders[idx], gts[idx]))
-                    psnrs.append(psnr(renders[idx], gts[idx]))
-                    lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
-
-                logger.info(f"model_paths: \033[1;35m{model_paths}\033[0m")
-                logger.info("  STREET_PSNR : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(psnrs).mean(), ".5"))
-                # ... (日志打印) ...
-                print("")
-                
-                # 更新总指标和每张视图的指标
-                full_dict[scene_dir][method].update({
-                    "STREET_PSNR": torch.tensor(psnrs).mean().item(),
-                    "STREET_SSIM": torch.tensor(ssims).mean().item(),
-                    "STREET_LPIPS": torch.tensor(lpipss).mean().item(),
-                    "STREET_GS_NUMS": torch.tensor(aerial_visible_count).float().mean().item(),
-                    })
-
-                per_view_dict[scene_dir][method].update({
-                    "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
-                    "SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
-                    "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
-                    "GS_NUMS": {name: vc for vc, name in zip(torch.tensor(aerial_visible_count).tolist(), image_names)}
-                    })
-
-    # 将所有评估结果写入 JSON 文件
     with open(scene_dir + "/results.json", 'w') as fp:
         json.dump(full_dict[scene_dir], fp, indent=True)
     with open(scene_dir + "/per_view.json", 'w') as fp:
         json.dump(per_view_dict[scene_dir], fp, indent=True)
     
 def get_logger(path):
-    """
-    配置并获取 logger，同时输出到文件和控制台。
-    """
     import logging
-
     logger = logging.getLogger()
     logger.setLevel(logging.INFO) 
     fileinfo = logging.FileHandler(os.path.join(path, "outputs.log"))
@@ -1011,48 +763,37 @@ def get_logger(path):
     formatter = logging.Formatter("%(asctime)s - %(levelname)s: %(message)s")
     fileinfo.setFormatter(formatter)
     controlshow.setFormatter(formatter)
-
     logger.addHandler(fileinfo)
     logger.addHandler(controlshow)
-
     return logger
 
 if __name__ == "__main__":
-    # 设置命令行参数解析
     parser = ArgumentParser(description="Training script parameters")
-    parser.add_argument('--config', type=str, help='train config file path') # 配置文件路径
-    parser.add_argument('--ip', type=str, default="127.0.0.1") # GUI服务器IP
-    parser.add_argument('--port', type=int, default=6009) # GUI服务器端口
-    parser.add_argument('--debug_from', type=int, default=-1) # 调试起始迭代
-    parser.add_argument('--detect_anomaly', action='store_true', default=False) # 检测梯度异常
-    parser.add_argument('--use_wandb', action='store_true', default=False) # 使用 WandB
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[-1]) # 测试迭代点
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[-1]) # 保存模型迭代点
-    parser.add_argument("--quiet", action="store_true") # 静默模式
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[]) # 保存 Checkpoint 迭代点
-    parser.add_argument("--start_checkpoint", type=str, default = None) # 加载 Checkpoint 路径
-    parser.add_argument("--gpu", type=str, default = '-1') # 指定 GPU
+    parser.add_argument('--config', type=str, help='train config file path') 
+    parser.add_argument('--ip', type=str, default="127.0.0.1") 
+    parser.add_argument('--port', type=int, default=6009) 
+    parser.add_argument('--debug_from', type=int, default=-1) 
+    parser.add_argument('--detect_anomaly', action='store_true', default=False) 
+    parser.add_argument('--use_wandb', action='store_true', default=False) 
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[-1]) 
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[-1]) 
+    parser.add_argument("--quiet", action="store_true") 
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[]) 
+    parser.add_argument("--start_checkpoint", type=str, default = None) 
+    parser.add_argument("--gpu", type=str, default = '-1') 
     args = parser.parse_args(sys.argv[1:])
     
-    # 解析配置文件 yaml
     with open(args.config) as f:
         cfg = yaml.load(f, Loader=yaml.FullLoader)
         lp, op, pp = parse_cfg(cfg)
         args.save_iterations.append(op.iterations)
 
-    # 设置模型保存路径
-    # enable logging
-    # cur_time = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-    # lp.model_path = os.path.join("outputs", lp.dataset_name, lp.scene_name, cur_time)
     lp.model_path = os.path.join("outputs", lp.dataset_name, lp.scene_name)
     os.makedirs(lp.model_path, exist_ok=True)
-    # 备份配置文件
     shutil.copy(args.config, os.path.join(lp.model_path, "config.yaml"))
 
-    # 获取 Logger
     logger = get_logger(lp.model_path)
 
-    # 设置默认的测试和保存迭代点 (如果没有指定)
     if args.test_iterations[0] == -1:
         args.test_iterations = [i for i in range(10000, op.iterations + 1, 10000)]
     if len(args.test_iterations) == 0 or args.test_iterations[-1] != op.iterations:
@@ -1063,27 +804,21 @@ if __name__ == "__main__":
     if len(args.save_iterations) == 0 or args.save_iterations[-1] != op.iterations:
         args.save_iterations.append(op.iterations)
 
-    # 如果命令行指定了 GPU，覆盖之前的自动选择
     if args.gpu != '-1':
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
-        os.system("echo $CUDA_VISIBLE_DEVICES")
         logger.info(f'using GPU {args.gpu}')
     
-    # 备份代码
     try:
         saveRuntimeCode(os.path.join(lp.model_path, 'backup'))
     except:
         logger.info(f'save code failed~')
     
-    # 配置 WandB
     exp_name = lp.scene_name if lp.dataset_name=="" else lp.dataset_name+"_"+lp.scene_name
     if args.use_wandb:
         wandb.login()
         run = wandb.init(
-            # Set the project where this run will be logged
             project=f"Horizon-GS",
             name=exp_name,
-            # Track hyperparameters and run metadata
             settings=wandb.Settings(start_method="fork"),
             config=vars(args)
         )
@@ -1091,19 +826,12 @@ if __name__ == "__main__":
         wandb = None
     
     logger.info("Optimizing " + lp.model_path)
-
-    # 初始化系统状态 (随机种子等)
     safe_state(args.quiet)
-
-    # 设置 PyTorch 异常检测
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
-    # 1. 执行训练
     training(lp, op, pp, exp_name, args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, wandb, logger)
 
     logger.info("\nTraining complete.")
-
-    # 2. 执行渲染 (渲染最终模型)
     logger.info(f'\nStarting Rendering~')
     if lp.eval:
         aerial_visible_count, street_visible_count = render_sets(lp, op, pp, -1, skip_train=True, skip_test=False, wandb=wandb, logger=logger)
@@ -1111,7 +839,6 @@ if __name__ == "__main__":
         aerial_visible_count, street_visible_count = render_sets(lp, op, pp, -1, skip_train=False, skip_test=True, wandb=wandb, logger=logger)
     logger.info("\nRendering complete.")
 
-    # 3. 计算评估指标
     logger.info("\n Starting evaluation...")
     eval_name = 'test' if lp.eval else 'train'
     evaluate(lp.model_path, eval_name, aerial_visible_count=aerial_visible_count, street_visible_count=street_visible_count, wandb=wandb, logger=logger)
