@@ -20,7 +20,7 @@ model_params: {
     add_aerial: True,
     add_street: True,
     llffhold: 32,
-    source_path: "data/HorizonGS_data/real/park"
+    source_path: "data/real/park"
 }
 
 # Pipeline Parameters

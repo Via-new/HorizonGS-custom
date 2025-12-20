@@ -4,11 +4,11 @@ data_params: {
         kwargs: {
             fork: 2,
             gs_attr: "3D",
-            color_attr: "SH2",
+            color_attr: "RGB",
             feat_dim: 32,
-            view_dim: 0,
+            view_dim: 3,
             appearance_dim: 0,
-            n_offsets: 5, 
+            n_offsets: 10, 
             voxel_size: 0.001,
             render_mode: "RGB+ED",
         }
@@ -33,6 +33,6 @@ data_params: {
     aerial_lod: "multi",
     street_lod: "multi",
     dist_ratio: 0.999,
-    partition: True,
+    partition: False,
     llffhold: 32,
 }

@@ -33,6 +33,6 @@ data_params: {
     aerial_lod: "multi",
     street_lod: "multi",
     dist_ratio: 0.999,
-    partition: True,
+    partition: False,
     llffhold: 32,
 }
