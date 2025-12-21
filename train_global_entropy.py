@@ -14,9 +14,6 @@ import shutil
 import numpy as np
 import json
 import struct
-# Ensure torch.nn is imported
-import torch.nn as nn
-from utils.general_utils import build_rotation # Used to build rotation matrix from quaternion
 
 import subprocess
 # Build command to query nvidia-smi memory usage
@@ -127,56 +124,6 @@ def read_images_binary_debug(path_to_model_file):
         print(f"[DEBUG READ ERROR] {e}")
     return images
 # ================= [DIAGNOSIS HELPER FUNCTIONS END] =================
-
-
-# ================= [NEW] Pose Optimization Module Start =================
-
-class CameraPoseCorrection(nn.Module):
-    """
-    [Fixed Version] Relative Pose Optimization Module
-    Applies small rigid transformations (Delta Pose) in the camera coordinate system.
-    """
-    def __init__(self, cameras):
-        super().__init__()
-        self.camera_map = {cam.uid: i for i, cam in enumerate(cameras)}
-        n_cams = len(cameras)
-        
-        # Rotation correction: small rotation, initialized as identity quaternion
-        self.q_delta = nn.Parameter(torch.tensor([1., 0., 0., 0.], dtype=torch.float32).repeat(n_cams, 1))
-        
-        # Translation correction: small translation, initialized as 0
-        self.t_delta = nn.Parameter(torch.zeros(n_cams, 3, dtype=torch.float32))
-
-    def forward(self, cam_uid, original_w2c_transposed):
-        """
-        Input:
-            original_w2c_transposed: original world_view_transform (4x4 Tensor, Transposed)
-        Returns:
-            new_w2c_transposed: corrected world_view_transform
-        """
-        idx = self.camera_map[cam_uid]
-        
-        # 1. Get correction parameters
-        q = self.q_delta[idx]
-        t = self.t_delta[idx]
-        
-        # 2. Build Delta Matrix (4x4)
-        R_delta = build_rotation(q.unsqueeze(0)).squeeze(0) # (3,3)
-        
-        Delta = torch.eye(4, device=q.device)
-        Delta[:3, :3] = R_delta
-        Delta[:3, 3] = t
-        
-        # 3. Apply correction
-        # 3DGS world_view_transform is transposed (Col-Major)
-        W2C_orig = original_w2c_transposed.transpose(0, 1) # (4,4) Row-Major
-        
-        # Core logic: W2C_new = Delta @ W2C_orig
-        W2C_new = Delta @ W2C_orig
-        
-        # 4. Transpose back
-        return W2C_new.transpose(0, 1)
-        
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, wandb=None, logger=None, ply_path=None):
     """
