@@ -672,22 +672,11 @@ class GaussianLoDModel(BasicModel):
 
     def roll_back(self):
         base_mask = (self._level < self.aerial_levels).squeeze()
-        # self._anchor[base_mask] = self.base_anchor
-        # self._anchor_feat[base_mask] = self.base_anchor_feat
-        # self._offset[base_mask] = self.base_offset
-        # self._scaling[base_mask] = self.base_scaling
-        # self._rotation[base_mask] = self.base_rotation
-        # [核心修复]：左右两边必须同时应用 mask，保证形状对齐
-        # 1. 恢复位置
-        self._anchor[base_mask] = self.base_anchor[base_mask]
-        # 2. 恢复特征 (你报错的地方)
-        self._anchor_feat[base_mask] = self.base_anchor_feat[base_mask]
-        # 3. 恢复偏移
-        self._offset[base_mask] = self.base_offset[base_mask]
-        # 4. 恢复缩放
-        self._scaling[base_mask] = self.base_scaling[base_mask]
-        # 5. 恢复旋转
-        self._rotation[base_mask] = self.base_rotation[base_mask]
+        self._anchor[base_mask] = self.base_anchor
+        self._anchor_feat[base_mask] = self.base_anchor_feat
+        self._offset[base_mask] = self.base_offset
+        self._scaling[base_mask] = self.base_scaling
+        self._rotation[base_mask] = self.base_rotation
 
     def save_explicit(self, path):
     
