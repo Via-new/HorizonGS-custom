@@ -825,14 +825,14 @@ def evaluate(model_paths, eval_name, aerial_visible_count=None, street_visible_c
                     "AERIAL_PSNR": torch.tensor(psnrs).mean().item(),
                     "AERIAL_SSIM": torch.tensor(ssims).mean().item(),
                     "AERIAL_LPIPS": torch.tensor(lpipss).mean().item(),
-                    "AERIAL_GS_NUMS": torch.tensor(aerial_visible_count).float().mean().item(),
+                    # "AERIAL_GS_NUMS": torch.tensor(aerial_visible_count).float().mean().item(),
                     })
 
                 per_view_dict[scene_dir][method].update({
                     "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
                     "SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
                     "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
-                    "GS_NUMS": {name: vc for vc, name in zip(torch.tensor(aerial_visible_count).tolist(), image_names)}
+                    # "GS_NUMS": {name: vc for vc, name in zip(torch.tensor(aerial_visible_count).tolist(), image_names)}
                     })
 
             # Street evaluation
@@ -861,14 +861,14 @@ def evaluate(model_paths, eval_name, aerial_visible_count=None, street_visible_c
                     "STREET_PSNR": torch.tensor(psnrs).mean().item(),
                     "STREET_SSIM": torch.tensor(ssims).mean().item(),
                     "STREET_LPIPS": torch.tensor(lpipss).mean().item(),
-                    "STREET_GS_NUMS": torch.tensor(aerial_visible_count).float().mean().item(),
+                    # "STREET_GS_NUMS": torch.tensor(aerial_visible_count).float().mean().item(),
                     })
 
                 per_view_dict[scene_dir][method].update({
                     "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
                     "SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
                     "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
-                    "GS_NUMS": {name: vc for vc, name in zip(torch.tensor(aerial_visible_count).tolist(), image_names)}
+                    # "GS_NUMS": {name: vc for vc, name in zip(torch.tensor(aerial_visible_count).tolist(), image_names)}
                     })
 
     # Write to JSON
@@ -981,20 +981,20 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
     # 1. Execute training
-    training(lp, op, pp, exp_name, args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, wandb, logger)
+    # training(lp, op, pp, exp_name, args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, wandb, logger)
 
-    logger.info("\nTraining complete.")
+    # logger.info("\nTraining complete.")
 
-    # 2. Execute rendering
-    logger.info(f'\nStarting Rendering~')
-    if lp.eval:
-        aerial_visible_count, street_visible_count = render_sets(lp, op, pp, -1, skip_train=True, skip_test=False, wandb=wandb, logger=logger)
-    else:
-        aerial_visible_count, street_visible_count = render_sets(lp, op, pp, -1, skip_train=False, skip_test=True, wandb=wandb, logger=logger)
-    logger.info("\nRendering complete.")
+    # # 2. Execute rendering
+    # logger.info(f'\nStarting Rendering~')
+    # if lp.eval:
+    #     aerial_visible_count, street_visible_count = render_sets(lp, op, pp, -1, skip_train=True, skip_test=False, wandb=wandb, logger=logger)
+    # else:
+    #     aerial_visible_count, street_visible_count = render_sets(lp, op, pp, -1, skip_train=False, skip_test=True, wandb=wandb, logger=logger)
+    # logger.info("\nRendering complete.")
 
     # 3. Calculate evaluation metrics
     logger.info("\n Starting evaluation...")
     eval_name = 'test' if lp.eval else 'train'
-    evaluate(lp.model_path, eval_name, aerial_visible_count=41, street_visible_count=16, wandb=wandb, logger=logger)
+    evaluate(lp.model_path, eval_name, aerial_visible_count=16, street_visible_count=41, wandb=wandb, logger=logger)
     logger.info("\nEvaluating complete.")
