@@ -103,7 +103,7 @@ optim_params: {
     update_interval: 100,            # 致密化操作的间隔步数
     update_until: 20000,             # 停止致密化的步数（之后只优化参数不增减点）
     overlap: False,                  # 是否检查重叠
-    densification: True,             # 总开关：是否启用致密化
+    densification: False,             # 总开关：是否启用致密化
     growing_type: max,               # 生长类型策略
     pruning_type: mean,              # 剪枝类型策略
     min_opacity: 0.005000,           # 最小不透明度阈值（低于此值的点会被剪枝删除）

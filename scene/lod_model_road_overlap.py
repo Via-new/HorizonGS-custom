@@ -553,8 +553,20 @@ class GaussianLoDModel(BasicModel):
                 remove_duplicates_clone = remove_duplicates.clone()
                 remove_duplicates[remove_duplicates_clone] = weed_mask
 
+            # =================== [请修改这一段] ===================
             if candidate_anchor.shape[0] > 0:
-                new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
+                # 1. 找出 mask 中为 True 的位置索引
+                # [修改前 - 会导致单个点时报错]:
+                # active_indices = torch.nonzero(candidate_mask).squeeze()
+                
+                # [修改后 - 正确写法]: 使用 reshape(-1) 强制展平为 1维
+                active_indices = torch.nonzero(candidate_mask).reshape(-1)
+                
+                # 2. 计算这些新点对应原本哪个 anchor
+                parent_indices = active_indices // self.n_offsets
+                
+                # 3. 取特征
+                new_feat = self._anchor_feat[parent_indices]
                 new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
 
                 new_scaling = torch.ones_like(candidate_anchor).repeat([1,2]).float().cuda()*voxel_size # *0.05
@@ -677,17 +689,6 @@ class GaussianLoDModel(BasicModel):
         self._offset[base_mask] = self.base_offset
         self._scaling[base_mask] = self.base_scaling
         self._rotation[base_mask] = self.base_rotation
-        # [核心修复]：左右两边必须同时应用 mask，保证形状对齐
-        # 1. 恢复位置
-        # self._anchor[base_mask] = self.base_anchor[base_mask]
-        # # 2. 恢复特征 (你报错的地方)
-        # self._anchor_feat[base_mask] = self.base_anchor_feat[base_mask]
-        # # 3. 恢复偏移
-        # self._offset[base_mask] = self.base_offset[base_mask]
-        # # 4. 恢复缩放
-        # self._scaling[base_mask] = self.base_scaling[base_mask]
-        # # 5. 恢复旋转
-        # self._rotation[base_mask] = self.base_rotation[base_mask]
 
     def save_explicit(self, path):
     
