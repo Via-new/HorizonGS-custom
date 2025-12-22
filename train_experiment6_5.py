@@ -459,13 +459,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     densify_cnt += 1 
 
                 if opt.densification and iteration > opt.update_from and densify_cnt > 0 and densify_cnt % opt.update_interval == 0:
-                    if dataset.pretrained_checkpoint != "":
-                        gaussians.roll_back()
+                    # if dataset.pretrained_checkpoint != "":
+                    #     gaussians.roll_back()
                     gaussians.run_densify(opt, iteration)
             
             elif iteration == opt.update_until:
-                if dataset.pretrained_checkpoint != "":
-                    gaussians.roll_back()
+                # if dataset.pretrained_checkpoint != "":
+                    # gaussians.roll_back()
                 gaussians.clean()
                     
             if iteration < opt.iterations:
@@ -935,7 +935,7 @@ if __name__ == "__main__":
 
     # Set default test and save iterations
     if args.test_iterations[0] == -1:
-        args.test_iterations = [i for i in range(5000, op.iterations + 1, 5000)]
+        args.test_iterations = [i for i in range(2000, op.iterations + 1, 2000)]
     if len(args.test_iterations) == 0 or args.test_iterations[-1] != op.iterations:
         args.test_iterations.append(op.iterations)
 

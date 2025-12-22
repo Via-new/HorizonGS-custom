@@ -672,22 +672,64 @@ class GaussianLoDModel(BasicModel):
 
     def roll_back(self):
         base_mask = (self._level < self.aerial_levels).squeeze()
-        self._anchor[base_mask] = self.base_anchor
-        self._anchor_feat[base_mask] = self.base_anchor_feat
-        self._offset[base_mask] = self.base_offset
-        self._scaling[base_mask] = self.base_scaling
-        self._rotation[base_mask] = self.base_rotation
+        # self._anchor[base_mask] = self.base_anchor
+        # self._anchor_feat[base_mask] = self.base_anchor_feat
+        # self._offset[base_mask] = self.base_offset
+        # self._scaling[base_mask] = self.base_scaling
+        # self._rotation[base_mask] = self.base_rotation
         # [核心修复]：左右两边必须同时应用 mask，保证形状对齐
         # 1. 恢复位置
-        # self._anchor[base_mask] = self.base_anchor[base_mask]
-        # # 2. 恢复特征 (你报错的地方)
-        # self._anchor_feat[base_mask] = self.base_anchor_feat[base_mask]
-        # # 3. 恢复偏移
-        # self._offset[base_mask] = self.base_offset[base_mask]
-        # # 4. 恢复缩放
-        # self._scaling[base_mask] = self.base_scaling[base_mask]
-        # # 5. 恢复旋转
-        # self._rotation[base_mask] = self.base_rotation[base_mask]
+        self._anchor[base_mask] = self.base_anchor[base_mask]
+        # 2. 恢复特征 (你报错的地方)
+        self._anchor_feat[base_mask] = self.base_anchor_feat[base_mask]
+        # 3. 恢复偏移
+        self._offset[base_mask] = self.base_offset[base_mask]
+        # 4. 恢复缩放
+        self._scaling[base_mask] = self.base_scaling[base_mask]
+        # 5. 恢复旋转
+        self._rotation[base_mask] = self.base_rotation[base_mask]
+
+    # def roll_back(self):
+    #     # 1. 计算当前模型中属于 Level 0 的掩膜
+    #     base_mask = (self._level < self.aerial_levels).squeeze()
+
+    #     # ================== [新增调试代码 Start] ==================
+    #     current_total_count = self._anchor.shape[0]
+    #     backup_total_count = self.base_anchor.shape[0]
+    #     current_level0_count = base_mask.sum().item()
+        
+    #     print(f"\n[DEBUG ROLL_BACK] Iteration Check:")
+    #     print(f"  > self._level : {self._level}")
+    #     print(f"  > self.aerial_levels : {self.aerial_levels}")
+    #     print(f"  > Current Model Total Anchors : {current_total_count}")
+    #     print(f"  > Backup Snapshot Total Anchors: {backup_total_count}")
+    #     print(f"  > Current Level 0 Anchors (Mask True): {current_level0_count}")
+        
+    #     # 检查是否会有形状不匹配
+    #     if current_total_count != backup_total_count:
+    #         print(f"  [!] WARNING: Anchor count mismatch! Diff: {current_total_count - backup_total_count}")
+    #         # 如果你开启了致密化，这里肯定会不一致。
+    #         # 如果不一致，使用 base_mask 去索引 base_anchor 可能会越界（如果 mask 长度 > backup 长度）
+    #         if base_mask.shape[0] > self.base_anchor.shape[0]:
+    #              print(f"  [!] CRITICAL: Mask length ({base_mask.shape[0]}) > Backup length ({self.base_anchor.shape[0]}). Indexing will fail!")
+    #     else:
+    #         print(f"  [OK] Anchor counts match.")
+    #     # ================== [新增调试代码 End] ==================
+
+    #     # [核心修复]：左右两边必须同时应用 mask
+    #     # 注意：如果 densification 开启且点数增加了，下面这行 self.base_anchor[base_mask] 依然可能报错
+    #     # 因为 base_mask 是针对“当前变长了的数组”生成的，直接套用到“旧的短数组”上会索引越界
+    #     try:
+    #         self._anchor[base_mask] = self.base_anchor[base_mask]
+    #         self._anchor_feat[base_mask] = self.base_anchor_feat[base_mask]
+    #         self._offset[base_mask] = self.base_offset[base_mask]
+    #         self._scaling[base_mask] = self.base_scaling[base_mask]
+    #         self._rotation[base_mask] = self.base_rotation[base_mask]
+    #         print("  [SUCCESS] Roll back executed successfully.\n")
+    #     except IndexError as e:
+    #         print(f"  [ERROR] Roll back failed: {e}")
+    #         # 这里可以选择 raise e 让程序停止，或者 pass 跳过
+    #         raise e
 
     def save_explicit(self, path):
     

@@ -792,5 +792,5 @@ if __name__ == "__main__":
 
     logger.info("\n Starting evaluation...")
     eval_name = 'test' if lp.eval else 'train'
-    evaluate(lp.model_path, eval_name, aerial_visible_count=aerial_visible_count, street_visible_count=street_visible_count, wandb=wandb, logger=logger)
+    evaluate(lp.model_path, eval_name, aerial_visible_count=16, street_visible_count=41, wandb=wandb, logger=logger)
     logger.info("\nEvaluating complete.")

@@ -464,8 +464,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     gaussians.run_densify(opt, iteration)
             
             elif iteration == opt.update_until:
-                if dataset.pretrained_checkpoint != "":
-                    gaussians.roll_back()
+                # if dataset.pretrained_checkpoint != "":
+                    # gaussians.roll_back()
                 gaussians.clean()
                     
             if iteration < opt.iterations:
