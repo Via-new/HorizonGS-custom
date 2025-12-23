@@ -153,10 +153,12 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
+
 # def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, masks_folder, depths_folder, add_aerial, add_street):
 #     cam_infos = []
     
 #     def process_frame(idx, key):
+#         # key 就是 COLMAP 的 Image ID (Integer)
 #         extr = cam_extrinsics[key]
 #         intr = cam_intrinsics[extr.camera_id]
 #         height = intr.height
@@ -186,22 +188,66 @@ def storePly(path, xyz, rgb):
 #         image_name = os.path.basename(image_path).split(".")[0]
 #         image = Image.open(image_path)
 
+#         # ================= [FIX START] 鲁棒的参数查找 =================
 #         depth_params = None
 #         if depths_params is not None:
-#             try:
-#                 depth_params = depths_params[extr.name.split(".")[0]]
-#             except:
-#                 print("\n", key, "not found in depths_params")
+#             # 构造所有可能的 Key，挨个试
+#             keys_to_try = [
+#                 key,                        # 1. 整数 ID (最推荐)
+#                 str(key),                   # 2. 字符串 ID
+#                 extr.name,                  # 3. 相对路径 (aerial/001.png)
+#                 os.path.basename(extr.name),# 4. 文件名 (001.png)
+#                 extr.name.split(".")[0]     # 5. 旧逻辑 (aerial/001)
+#             ]
+            
+#             for k in keys_to_try:
+#                 if k in depths_params:
+#                     depth_params = depths_params[k]
+#                     break
+            
+#             # 如果试了一圈还是没找到，打印详细报错
+#             if depth_params is None:
+#                 # 为了防止多线程打印混乱，这里简单 print，或者你可以用 tqdm.write
+#                 print(f"\n[WARN] ID {key} ({extr.name}) not found in depths_params!")
+#         # ================= [FIX END] =================
+
 #         if masks_folder is not None:
 #             mask_path = os.path.join(masks_folder, extr.name)
-#             mask = Image.open(mask_path)
+#             if os.path.exists(mask_path):
+#                 mask = Image.open(mask_path)
+#             else:
+#                 mask = None
 #         else:
 #             mask = None
+
+#         # ================= [FIX START] 鲁棒的深度图路径查找 =================
+#         depth = None
 #         if depths_folder is not None:
-#             depth_path = os.path.join(depths_folder, extr.name.replace(".JPG", ".png")) 
-#             depth = cv2.imread(depth_path, -1).astype(np.float32) / float(2**16)
-#         else:
-#             depth = None
+#             # 尝试多种深度图命名/路径格式
+#             # 1. 直接替换后缀 (最常见)
+#             p1 = os.path.join(depths_folder, extr.name.replace(".JPG", ".png").replace(".jpg", ".png"))
+#             # 2. 也是替换后缀为 .npy
+#             p2 = os.path.join(depths_folder, extr.name.replace(".JPG", ".npy").replace(".jpg", ".npy"))
+#             # 3. 只有文件名 (不带 aerial/street 目录)
+#             p3 = os.path.join(depths_folder, os.path.basename(extr.name).replace(".JPG", ".png").replace(".jpg", ".png"))
+#             p4 = os.path.join(depths_folder, os.path.basename(extr.name).replace(".JPG", ".npy").replace(".jpg", ".npy"))
+
+#             candidate_paths = [p1, p2, p3, p4]
+            
+#             for d_path in candidate_paths:
+#                 if os.path.exists(d_path):
+#                     if d_path.endswith(".npy"):
+#                         depth = np.load(d_path)
+#                     else:
+#                         # 假设 png 存的是 16bit 深度，需要除以 65535 或者 1000 (视具体数据而定)
+#                         # HorizonGS 默认行为是 / 2**16
+#                         depth = cv2.imread(d_path, -1)
+#                         if depth is not None:
+#                             depth = depth.astype(np.float32) / float(2**16)
+                    
+#                     if depth is not None:
+#                         break # 找到了就退出循环
+#         # ================= [FIX END] =================
 
 #         return CameraInfo(
 #             uid=uid, 
@@ -222,6 +268,7 @@ def storePly(path, xyz, rgb):
 #         )
 
 #     ct = 0
+#     # 注意：这里把 cam_extrinsics 转为 list 可能会更稳定，因为它是 dict
 #     progress_bar = tqdm(cam_extrinsics, desc="Loading dataset")
 
 #     with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -231,18 +278,23 @@ def storePly(path, xyz, rgb):
 #             cam_info = future.result()
 #             if cam_info is None:
 #                 continue
-#             if "aerial" in cam_info.image_path:
+            
+#             # 这里的路径判断也建议加个 lower() 增加鲁棒性
+#             path_lower = cam_info.image_path.lower()
+            
+#             if "aerial" in path_lower:
 #                 if add_aerial:
 #                     cam_infos.append(cam_info)
-#             elif "street" in cam_info.image_path: 
+#             elif "street" in path_lower: 
 #                 if add_street:
 #                     cam_infos.append(cam_info)
 #             else:
+#                 # 默认行为
 #                 cam_infos.append(cam_info)
             
 #             ct+=1
 #             if ct % 10 == 0:
-#                 progress_bar.set_postfix({"num": Fore.YELLOW+f"{ct}/{len(cam_extrinsics)}"+Style.RESET_ALL})
+#                 progress_bar.set_postfix({"num": f"{ct}/{len(cam_extrinsics)}"})
 #                 progress_bar.update(10)
 
 #         progress_bar.close()
@@ -284,87 +336,63 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
-        # ================= [FIX START] 鲁棒的参数查找 =================
+        # ---------------- 查找深度参数 ----------------
         depth_params = None
         if depths_params is not None:
-            # 构造所有可能的 Key，挨个试
+            # 尝试多种 Key 匹配，增加鲁棒性
             keys_to_try = [
-                key,                        # 1. 整数 ID (最推荐)
-                str(key),                   # 2. 字符串 ID
-                extr.name,                  # 3. 相对路径 (aerial/001.png)
-                os.path.basename(extr.name),# 4. 文件名 (001.png)
-                extr.name.split(".")[0]     # 5. 旧逻辑 (aerial/001)
+                key, str(key), extr.name, 
+                os.path.basename(extr.name), extr.name.split(".")[0]
             ]
-            
             for k in keys_to_try:
                 if k in depths_params:
                     depth_params = depths_params[k]
                     break
-            
-            # 如果试了一圈还是没找到，打印详细报错
-            if depth_params is None:
-                # 为了防止多线程打印混乱，这里简单 print，或者你可以用 tqdm.write
-                print(f"\n[WARN] ID {key} ({extr.name}) not found in depths_params!")
-        # ================= [FIX END] =================
-
+        
+        # ---------------- 查找 Mask (并区分是否存在) ----------------
+        mask = None
+        # 这里只负责“尝试读取”，如果不存在就保持 None
         if masks_folder is not None:
             mask_path = os.path.join(masks_folder, extr.name)
+            # 尝试原名
             if os.path.exists(mask_path):
                 mask = Image.open(mask_path)
             else:
-                mask = None
-        else:
-            mask = None
+                # 尝试替换后缀 (例如 jpg -> png)
+                mask_path_png = os.path.splitext(mask_path)[0] + ".png"
+                if os.path.exists(mask_path_png):
+                    mask = Image.open(mask_path_png)
 
-        # ================= [FIX START] 鲁棒的深度图路径查找 =================
+        # ---------------- 查找深度图 ----------------
         depth = None
         if depths_folder is not None:
-            # 尝试多种深度图命名/路径格式
-            # 1. 直接替换后缀 (最常见)
-            p1 = os.path.join(depths_folder, extr.name.replace(".JPG", ".png").replace(".jpg", ".png"))
-            # 2. 也是替换后缀为 .npy
-            p2 = os.path.join(depths_folder, extr.name.replace(".JPG", ".npy").replace(".jpg", ".npy"))
-            # 3. 只有文件名 (不带 aerial/street 目录)
-            p3 = os.path.join(depths_folder, os.path.basename(extr.name).replace(".JPG", ".png").replace(".jpg", ".png"))
-            p4 = os.path.join(depths_folder, os.path.basename(extr.name).replace(".JPG", ".npy").replace(".jpg", ".npy"))
-
-            candidate_paths = [p1, p2, p3, p4]
-            
-            for d_path in candidate_paths:
+            # 尝试常见深度图后缀
+            candidates = [
+                extr.name.replace(".JPG", ".png").replace(".jpg", ".png"),
+                extr.name.replace(".JPG", ".npy").replace(".jpg", ".npy"),
+                os.path.basename(extr.name).replace(".JPG", ".png").replace(".jpg", ".png")
+            ]
+            for c_name in candidates:
+                d_path = os.path.join(depths_folder, c_name)
                 if os.path.exists(d_path):
                     if d_path.endswith(".npy"):
                         depth = np.load(d_path)
                     else:
-                        # 假设 png 存的是 16bit 深度，需要除以 65535 或者 1000 (视具体数据而定)
-                        # HorizonGS 默认行为是 / 2**16
                         depth = cv2.imread(d_path, -1)
                         if depth is not None:
                             depth = depth.astype(np.float32) / float(2**16)
-                    
-                    if depth is not None:
-                        break # 找到了就退出循环
-        # ================= [FIX END] =================
+                    break
 
         return CameraInfo(
-            uid=uid, 
-            R=R, 
-            T=T, 
-            FovY=FovY,
-            FovX=FovX, 
-            CX=CX,
-            CY=CY,
-            image=image,
-            mask=mask,
-            depth=depth,
-            depth_params=depth_params,
-            image_path=image_path, 
-            image_name=image_name, 
-            width=width, 
-            height=height
+            uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, CX=CX, CY=CY,
+            image=image, mask=mask, depth=depth, depth_params=depth_params,
+            image_path=image_path, image_name=image_name, width=width, height=height
         )
 
     ct = 0
-    # 注意：这里把 cam_extrinsics 转为 list 可能会更稳定，因为它是 dict
+    # [新增] 真实 Mask 计数器
+    real_mask_count = 0
+    
     progress_bar = tqdm(cam_extrinsics, desc="Loading dataset")
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -375,18 +403,22 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
             if cam_info is None:
                 continue
             
-            # 这里的路径判断也建议加个 lower() 增加鲁棒性
+            # 过滤逻辑
             path_lower = cam_info.image_path.lower()
+            keep = False
             
             if "aerial" in path_lower:
-                if add_aerial:
-                    cam_infos.append(cam_info)
+                if add_aerial: keep = True
             elif "street" in path_lower: 
-                if add_street:
-                    cam_infos.append(cam_info)
+                if add_street: keep = True
             else:
-                # 默认行为
+                keep = True # 默认保留其他图片
+            
+            if keep:
                 cam_infos.append(cam_info)
+                # [新增] 如果读到了有效的 mask 对象，计数加 1
+                if cam_info.mask is not None:
+                    real_mask_count += 1
             
             ct+=1
             if ct % 10 == 0:
@@ -395,8 +427,24 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         progress_bar.close()
 
+    # [新增] 打印真实的 Mask 加载统计信息
+    total_cams = len(cam_infos)
+    print("\n" + "="*50)
+    print(f" [Dataset Reader Report]")
+    print(f" Total Cameras Loaded : {total_cams}")
+    print(f" Masks Found on Disk  : {real_mask_count}")
+    
+    if real_mask_count == 0:
+        print(f" {Fore.RED}[WARNING] No masks found! Training will use default FULL-WHITE masks.{Style.RESET_ALL}")
+    elif real_mask_count < total_cams:
+        print(f" {Fore.YELLOW}[WARNING] Missing {total_cams - real_mask_count} masks. Missing ones will default to FULL-WHITE.{Style.RESET_ALL}")
+    else:
+        print(f" {Fore.GREEN}[OK] All {total_cams} cameras have corresponding mask files.{Style.RESET_ALL}")
+    print("="*50 + "\n")
+
     cam_infos = sorted(cam_infos, key = lambda x : x.image_path)
     return cam_infos
+
 
 def readUCGSCameras(cam_extrinsics, cam_intrinsics, images_folder, add_aerial, add_street):
     cam_infos = []

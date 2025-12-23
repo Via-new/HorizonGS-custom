@@ -981,20 +981,20 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
     # 1. Execute training
-    # training(lp, op, pp, exp_name, args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, wandb, logger)
+    training(lp, op, pp, exp_name, args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, wandb, logger)
 
-    # logger.info("\nTraining complete.")
+    logger.info("\nTraining complete.")
 
-    # # 2. Execute rendering
-    # logger.info(f'\nStarting Rendering~')
-    # if lp.eval:
-    #     aerial_visible_count, street_visible_count = render_sets(lp, op, pp, -1, skip_train=True, skip_test=False, wandb=wandb, logger=logger)
-    # else:
-    #     aerial_visible_count, street_visible_count = render_sets(lp, op, pp, -1, skip_train=False, skip_test=True, wandb=wandb, logger=logger)
-    # logger.info("\nRendering complete.")
+    # 2. Execute rendering
+    logger.info(f'\nStarting Rendering~')
+    if lp.eval:
+        aerial_visible_count, street_visible_count = render_sets(lp, op, pp, -1, skip_train=True, skip_test=False, wandb=wandb, logger=logger)
+    else:
+        aerial_visible_count, street_visible_count = render_sets(lp, op, pp, -1, skip_train=False, skip_test=True, wandb=wandb, logger=logger)
+    logger.info("\nRendering complete.")
 
     # 3. Calculate evaluation metrics
     logger.info("\n Starting evaluation...")
     eval_name = 'test' if lp.eval else 'train'
-    evaluate(lp.model_path, eval_name, aerial_visible_count=16, street_visible_count=41, wandb=wandb, logger=logger)
+    evaluate(lp.model_path, eval_name, aerial_visible_count=aerial_visible_count, street_visible_count=street_visible_count, wandb=wandb, logger=logger)
     logger.info("\nEvaluating complete.")

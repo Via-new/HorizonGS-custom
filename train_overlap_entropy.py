@@ -40,7 +40,7 @@ import yaml
 import torch.nn.functional as F
 import warnings
 
-# 忽略警告信息
+# Ignore warnings
 warnings.filterwarnings('ignore')
 
 # GPU Setup
@@ -63,141 +63,36 @@ except ImportError:
     TENSORBOARD_FOUND = False
     print("not found tf board")
 
-# ================= [CORE UTILS: FROM DEBUG_OVERLAP_V3] =================
+# ================= [CORE UTILS] =================
 
 class FrustumCuller:
     """
-    [Fixed Logic from debug_overlapV3.py]
-    负责计算 3D 锚点与相机视锥体的几何关系。
+    [Fixed Logic] Responsible for calculating geometric relationship between 3D anchors and camera frustum.
     """
     @staticmethod
     def filter_anchors_by_frustum(anchors, view_proj_matrix, margin=0.5): 
-        # 1. 齐次坐标变换
+        # 
         p_hom = torch.cat([anchors, torch.ones_like(anchors[:, :1])], dim=1) 
-        # [Correct Order]: p_hom @ Matrix for row-major systems in Torch/3DGS
         p_clip = p_hom @ view_proj_matrix 
         
-        # 2. W 判断 (Z深度 > epsilon)
         valid_w = p_clip[:, 3] > 0.001
         
-        # 3. 透视除法
         denom = p_clip[:, 3] + 1e-6
         p_ndc_x = p_clip[:, 0] / denom
         p_ndc_y = p_clip[:, 1] / denom
         
-        # 4. 范围判断
         limit = 1.0 + margin 
         mask_x = (p_ndc_x > -limit) & (p_ndc_x < limit)
         mask_y = (p_ndc_y > -limit) & (p_ndc_y < limit)
         
         return valid_w & mask_x & mask_y
 
-def project_points_to_2d_mask(anchors, mask_indices, view_cam, height, width, dilation=15):
-    """
-    [Safe Mask Generator]
-    将 3D 点投影到 2D 屏幕，生成二值 Mask。
-    使用较大的 dilation 来将稀疏的 Level 0 锚点连成片。
-    """
-    selected_anchors = anchors[mask_indices]
-    if selected_anchors.shape[0] == 0:
-        return torch.zeros((1, height, width), device="cuda")
-
-    # Projection
-    p_hom = torch.cat([selected_anchors, torch.ones_like(selected_anchors[:, :1])], dim=1)
-    p_clip = p_hom @ view_cam.full_proj_transform
-    
-    valid_z = p_clip[:, 3] > 0.001
-    p_ndc = p_clip[valid_z, :3] / p_clip[valid_z, 3:4]
-    
-    # Clip to screen
-    valid_screen = (p_ndc[:, 0] > -1.2) & (p_ndc[:, 0] < 1.2) & \
-                   (p_ndc[:, 1] > -1.2) & (p_ndc[:, 1] < 1.2)
-    p_ndc = p_ndc[valid_screen]
-    
-    if p_ndc.shape[0] == 0:
-        return torch.zeros((1, height, width), device="cuda")
-
-    # Map to pixels
-    u = ((p_ndc[:, 0] + 1) * width - 1) * 0.5
-    v = ((p_ndc[:, 1] + 1) * height - 1) * 0.5
-    
-    u = u.long().clamp(0, width - 1)
-    v = v.long().clamp(0, height - 1)
-    
-    mask = torch.zeros((height, width), device="cuda", dtype=torch.float32)
-    mask[v, u] = 1.0
-    
-    # Dilation to fill gaps between Level 0 anchors
-    if dilation > 0:
-        mask = mask.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
-        mask = F.max_pool2d(mask, kernel_size=2*dilation+1, stride=1, padding=dilation)
-        mask = mask.squeeze()
-        
-    return mask # [H, W]
-
-class Level0OverlapManager:
-    """
-    专门用于管理 Level 0 的重叠锚点。
-    """
-    def __init__(self):
-        self.overlap_indices = None
-        self.is_initialized = False
-
-    def precompute(self, scene, gaussians, logger):
-        """
-        预计算：找出同时在街景和航拍视锥内的 Level 0 锚点索引。
-        """
-        logger.info("[L0 Manager] Pre-computing Overlap Level 0 Indices...")
-        
-        # 1. 准备数据
-        all_anchors = gaussians.get_anchor.detach()
-        all_levels = gaussians.get_level.detach().squeeze()
-        
-        # 2. 筛选 Level 0
-        is_level0 = (all_levels == 0)
-        level0_indices_global = torch.nonzero(is_level0).squeeze()
-        level0_anchors = all_anchors[is_level0]
-        
-        n_l0 = level0_anchors.shape[0]
-        logger.info(f"[L0 Manager] Total Level 0 Anchors: {n_l0}")
-
-        # 3. 街景覆盖检测
-        street_cams = [c for c in scene.getTrainCameras() if c.image_type == 'street']
-        if len(street_cams) == 0:
-            logger.warning("No street cameras found! Skipping overlap logic.")
-            return
-
-        seen_by_street = torch.zeros(n_l0, dtype=torch.bool, device="cuda")
-        # 抽样检测以加速 (每5张抽1张)
-        for cam in tqdm(street_cams[::5], desc="Checking Street Visibility"):
-            mask = FrustumCuller.filter_anchors_by_frustum(level0_anchors, cam.full_proj_transform, margin=0.2)
-            seen_by_street |= mask
-
-        # 4. 航拍覆盖检测
-        aerial_cams = [c for c in scene.getTrainCameras() if c.image_type == 'aerial']
-        if len(aerial_cams) == 0:
-            logger.warning("No aerial cameras found! Skipping overlap logic.")
-            return
-
-        seen_by_aerial = torch.zeros(n_l0, dtype=torch.bool, device="cuda")
-        for cam in tqdm(aerial_cams[::5], desc="Checking Aerial Visibility"):
-            mask = FrustumCuller.filter_anchors_by_frustum(level0_anchors, cam.full_proj_transform, margin=0.2)
-            seen_by_aerial |= mask
-            
-        # 5. 取交集
-        overlap_mask_local = seen_by_street & seen_by_aerial
-        
-        # 6. 映射回全局索引
-        self.overlap_indices = level0_indices_global[overlap_mask_local]
-        self.is_initialized = True
-        
-        count = self.overlap_indices.shape[0]
-        logger.info(f"[L0 Manager] Found {count} Overlap Level 0 Anchors ({count/n_l0*100:.2f}% of L0).")
-
 # ================= [TRAINING LOGIC] =================
 
-def saveRuntimeCode(dst: str) -> None:
-    # ... (Keep existing code saving logic) ...
+def saveRuntimeCode(dst: str, logger=None) -> None:
+    """
+    Backup runtime code to destination folder.
+    """
     additionalIgnorePatterns = ['.git', '.gitignore']
     ignorePatterns = set()
     ROOT = '.'
@@ -215,13 +110,17 @@ def saveRuntimeCode(dst: str) -> None:
     log_dir = Path(__file__).resolve().parent
     try:
         shutil.copytree(log_dir, dst, ignore=shutil.ignore_patterns(*ignorePatterns))
-        print('Backup Finished!')
+        if logger:
+            logger.info('Backup Finished!')
+        else:
+            print('Backup Finished!')
     except:
         pass
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, wandb=None, logger=None, ply_path=None):
     first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
+    # [Modified] Pass logger to prepare_output_and_logger
+    tb_writer = prepare_output_and_logger(dataset, logger)
 
     modules = __import__('scene')
     model_config = dataset.model_config
@@ -229,7 +128,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     
     scene = Scene(dataset, gaussians, shuffle=False, logger=logger, weed_ratio=pipe.weed_ratio)
 
-    # --- 修正相机类型 ---
+    # --- Fix Camera Types ---
     logger.info("Classifying camera types...")
     aerial_cnt, street_cnt = 0, 0
     for cam in scene.getTrainCameras():
@@ -243,12 +142,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     scene.add_street = (street_cnt > 0)
     logger.info(f"Cameras: Aerial={aerial_cnt}, Street={street_cnt}")
 
-    # --- [NEW] 初始化 Level 0 重叠管理器 ---
-    l0_manager = Level0OverlapManager()
-    if scene.add_aerial and scene.add_street:
-        # 在这里预计算索引
-        l0_manager.precompute(scene, gaussians, logger)
-
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -259,7 +152,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
     
-    # 随机采样器
     viewpoint_stack = None
     
     ema_loss_for_log = 0.0
@@ -270,13 +162,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     first_iter += 1
     modules = __import__('gaussian_renderer')
     
-    # --- 熵损失参数 ---
-    ENTROPY_START_ITER = 3000   # 给模型一点预热时间
-    ENTROPY_WEIGHT = 0.05       # 权重：建议 0.01 - 0.1
-    MASK_DILATION = 20          # 膨胀半径，因为Level 0很稀疏，需要连成片
+    # --- Entropy Loss Parameters (Consistent with Overlap version for comparison) ---
+    ENTROPY_START_ITER = 3000   
+    ENTROPY_WEIGHT = 0.05       
     
+    logger.info(f"[COMPARISON EXPERIMENT] Running GLOBAL Entropy Loss (No Masking) starting at iter {ENTROPY_START_ITER}")
+
     for iteration in range(first_iter, opt.iterations + 1):        
-        # ... (GUI Communication Code Omitted for Brevity, keep it if needed) ...
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -291,62 +183,55 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     break
             except Exception as e:
                 network_gui.conn = None
-        # ... 
 
         iter_start.record()
         gaussians.update_learning_rate(iteration)
         
-        # 1. 随机选择一个相机 (标准训练流程)
+        # 1. Randomly select a camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        # 2. 渲染
+        # 2. Render
         render_pkg = getattr(modules, 'render')(viewpoint_cam, gaussians, pipe, scene.background)
         image, scaling, alpha = render_pkg["render"], render_pkg["scaling"], render_pkg["render_alphas"]
         
         gt_image = viewpoint_cam.original_image.cuda()
         alpha_mask = viewpoint_cam.alpha_mask.cuda()
         
-        # 应用 Alpha Mask (如果有)
+        # Apply Alpha Mask
         image = image * alpha_mask
         gt_image = gt_image * alpha_mask
 
-        # 3. 计算基础 RGB Loss
+        # 3. Calculate basic RGB Loss
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         
-        # ================= [OVERLAP ENTROPY OPTIMIZATION] =================
-        # 目标：在重叠区域(Level 0可见区)，强迫渲染结果变得不透明(实体化)，消除半透明堆叠。
-        # 只有在管理器初始化成功，且训练进入中期时才开启
-        if l0_manager.is_initialized and (iteration > ENTROPY_START_ITER):
+        # ================= [GLOBAL ENTROPY OPTIMIZATION] =================
+        # Key change here: calculate for the whole image without masking
+        if iteration > ENTROPY_START_ITER:
             
-            # A. 动态生成当前视角的“安全重叠掩膜”
-            # 将预计算的 Level 0 3D 索引投影到当前 2D 屏幕
-            overlap_mask_2d = project_points_to_2d_mask(
-                gaussians.get_anchor.detach(),  # 传入所有锚点(函数内会按索引取)
-                l0_manager.overlap_indices,     # 只投影这些重叠点
-                viewpoint_cam, 
-                image.shape[1], image.shape[2], 
-                dilation=MASK_DILATION
-            )
-            
-            # B. 计算不透明度熵
-            # alpha: [1, H, W]
-            # 限制范围防止 log(0)
+            # A. Clip range to avoid log(0)
             a_clip = torch.clamp(alpha, 1e-6, 1-1e-6)
-            # 熵公式: -p*log(p) - (1-p)*log(1-p). 当 p=0 或 p=1 时熵为 0.
+            
+            # B. Calculate global entropy
             entropy_map = - (a_clip * torch.log(a_clip) + (1-a_clip) * torch.log(1-a_clip))
             
-            # C. 施加约束 (只在 Mask 范围内)
-            # 使用 sum() / (sum() + epsilon) 避免除零
-            mask_sum = overlap_mask_2d.sum() + 1e-6
-            loss_entropy = (entropy_map * overlap_mask_2d).sum() / mask_sum
+            # C. If dataset has alpha_mask (e.g. remove sky), better calculate only within valid region
+            # Otherwise model will optimize opacity of black background, which is meaningless computation waste
+            # But this still belongs to "Global" category (i.e. not distinguishing overlap)
+            if alpha_mask is not None:
+                # Only apply constraint where GT exists
+                # Note alpha_mask is usually 3 channels, take single channel
+                valid_mask = alpha_mask[0:1, :, :]
+                loss_entropy = (entropy_map * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+            else:
+                # Truly global calculation
+                loss_entropy = entropy_map.mean()
             
             loss += ENTROPY_WEIGHT * loss_entropy
-        # ==================================================================
+        # =================================================================
 
-        # 其他正则化 Loss (保持原样)
         if opt.lambda_dreg > 0:
             if scaling.shape[0] > 0:
                 scaling_reg = scaling.prod(dim=1).mean()
@@ -355,14 +240,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             loss += opt.lambda_dreg * scaling_reg
         
         if opt.lambda_sky_opa > 0:
-             # 注意：Entropy Loss 可能会和 Sky Opacity Loss 冲突，
-             # 但由于我们用了 Mask 限制 Entropy 只在重叠区(地面)，所以理应不冲突。
             o = alpha.clamp(1e-6, 1-1e-6)
             sky = alpha_mask.float()
             loss_sky_opa = (-(1-sky) * torch.log(1 - o)).mean()
             loss += opt.lambda_sky_opa * loss_sky_opa
 
-        # 深度 Loss
         cur_Ll1depth = 0
         if iteration > opt.start_depth and depth_l1_weight(iteration) > 0 and viewpoint_cam.invdepthmap is not None:
             render_depth = render_pkg["render_depth"]
@@ -391,18 +273,22 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, getattr(modules, 'render'), (pipe, scene.background), wandb, logger)
             
             if (iteration in saving_iterations):
-                tqdm.write(f"[ITER {iteration}] Saving Gaussians")
+                # [NEW] Log saving info to outputs.log
+                msg = f"[ITER {iteration}] Saving Gaussians"
+                tqdm.write(msg)
+                if logger: logger.info(msg)
                 scene.save(iteration)
 
             if iteration % pipe.vis_step == 0 or iteration == 1:
                 vis_path = os.path.join(scene.model_path, "vis")
                 os.makedirs(vis_path, exist_ok=True)
-                # 如果开启了 Entropy 优化，顺便保存 Mask 看看有没有切准
-                if l0_manager.is_initialized and iteration > ENTROPY_START_ITER:
-                    # 生成一张 debug 图：左边是渲染，右边是 mask
-                    mask_vis = overlap_mask_2d.unsqueeze(0).repeat(3,1,1)
-                    combined = torch.cat([image, mask_vis], dim=2) # 左右拼接
-                    torchvision.utils.save_image(combined, os.path.join(vis_path, f"{iteration:05d}_{viewpoint_cam.colmap_id:03d}_entropy.png"))
+                # Save image, left is rendered image, right is Entropy heatmap (for visualization)
+                if iteration > ENTROPY_START_ITER:
+                    # Simple heatmap visualization: brighter means higher entropy (semi-transparent)
+                    # Normalize entropy for display (max entropy for p=0.5 is ~0.693)
+                    entropy_vis = (entropy_map / 0.693).repeat(3,1,1)
+                    combined = torch.cat([image, entropy_vis], dim=2)
+                    torchvision.utils.save_image(combined, os.path.join(vis_path, f"{iteration:05d}_{viewpoint_cam.colmap_id:03d}_global_entropy.png"))
                 else:
                     torchvision.utils.save_image(image, os.path.join(vis_path, f"{iteration:05d}_{viewpoint_cam.colmap_id:03d}.png"))
             
@@ -424,10 +310,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 pipe.add_prefilter = False
 
             if (iteration in checkpoint_iterations):
-                tqdm.write(f"[ITER {iteration}] Saving Checkpoint")
+                # [NEW] Log saving info to outputs.log
+                msg = f"[ITER {iteration}] Saving Checkpoint"
+                tqdm.write(msg)
+                if logger: logger.info(msg)
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-def prepare_output_and_logger(args):
+def prepare_output_and_logger(args, logger=None):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -435,7 +324,12 @@ def prepare_output_and_logger(args):
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
         
-    print("Output folder: {}".format(args.model_path))
+    # [Modified] Log output folder info
+    if logger:
+        logger.info("Output folder: {}".format(args.model_path))
+    else:
+        print("Output folder: {}".format(args.model_path))
+
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
@@ -444,7 +338,10 @@ def prepare_output_and_logger(args):
     if TENSORBOARD_FOUND:
         tb_writer = SummaryWriter(args.model_path)
     else:
-        print("Tensorboard not available: not logging progress")
+        if logger:
+            logger.info("Tensorboard not available: not logging progress")
+        else:
+            print("Tensorboard not available: not logging progress")
     return tb_writer
 
 def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
@@ -494,11 +391,18 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                 if scene.add_aerial and aerial_cnt > 0:
                     l1_test_aerial /= aerial_cnt
                     psnr_test_aerial /= aerial_cnt    
-                    tqdm.write("[ITER {}] Evaluating {} Aerial: L1 {} PSNR {}".format(iteration, config['name'], l1_test_aerial, psnr_test_aerial))
+                    # [NEW] Log to outputs.log
+                    msg = "[ITER {}] Evaluating {} Aerial: L1 {} PSNR {}".format(iteration, config['name'], l1_test_aerial, psnr_test_aerial)
+                    tqdm.write(msg)
+                    if logger: logger.info(msg)
+
                 if scene.add_street and street_cnt > 0:       
                     l1_test_street /= street_cnt
                     psnr_test_street /= street_cnt       
-                    tqdm.write("[ITER {}] Evaluating {} Street: L1 {} PSNR {}".format(iteration, config['name'], l1_test_street, psnr_test_street))
+                    # [NEW] Log to outputs.log
+                    msg = "[ITER {}] Evaluating {} Street: L1 {} PSNR {}".format(iteration, config['name'], l1_test_street, psnr_test_street)
+                    tqdm.write(msg)
+                    if logger: logger.info(msg)
                 
         if tb_writer:
             tb_writer.add_scalar(f'{dataset_name}/'+'total_points', len(scene.gaussians.get_anchor), iteration)
@@ -578,7 +482,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipe, background, 
         with open(os.path.join(model_path, name, "ours_{}".format(iteration), "aerial", "per_view_count.json"), 'w') as fp:
             json.dump(aerial_per_view_dict, fp, indent=True)
 
-    return aerial_visible_count, street_visible_count
+    return aerial_visible_count_list, street_visible_count_list
 
 def render_sets(dataset, opt, pipe, iteration, skip_train=False, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     with torch.no_grad():
@@ -746,7 +650,7 @@ if __name__ == "__main__":
     logger = get_logger(lp.model_path)
 
     if args.test_iterations[0] == -1:
-        args.test_iterations = [i for i in range(10000, op.iterations + 1, 10000)]
+        args.test_iterations = [i for i in range(100, op.iterations + 1, 100)]
     if len(args.test_iterations) == 0 or args.test_iterations[-1] != op.iterations:
         args.test_iterations.append(op.iterations)
 
@@ -760,7 +664,8 @@ if __name__ == "__main__":
         logger.info(f'using GPU {args.gpu}')
     
     try:
-        saveRuntimeCode(os.path.join(lp.model_path, 'backup'))
+        # [Modified] Pass logger to saveRuntimeCode
+        saveRuntimeCode(os.path.join(lp.model_path, 'backup'), logger=logger)
     except:
         logger.info(f'save code failed~')
     
@@ -792,5 +697,5 @@ if __name__ == "__main__":
 
     logger.info("\n Starting evaluation...")
     eval_name = 'test' if lp.eval else 'train'
-    evaluate(lp.model_path, eval_name, aerial_visible_count=16, street_visible_count=41, wandb=wandb, logger=logger)
+    evaluate(lp.model_path, eval_name, aerial_visible_count=aerial_visible_count, street_visible_count=street_visible_count, wandb=wandb, logger=logger)
     logger.info("\nEvaluating complete.")

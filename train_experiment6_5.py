@@ -935,7 +935,7 @@ if __name__ == "__main__":
 
     # Set default test and save iterations
     if args.test_iterations[0] == -1:
-        args.test_iterations = [i for i in range(2000, op.iterations + 1, 2000)]
+        args.test_iterations = [i for i in range(5000, op.iterations + 1, 5000)]
     if len(args.test_iterations) == 0 or args.test_iterations[-1] != op.iterations:
         args.test_iterations.append(op.iterations)
 
@@ -996,5 +996,5 @@ if __name__ == "__main__":
     # 3. Calculate evaluation metrics
     logger.info("\n Starting evaluation...")
     eval_name = 'test' if lp.eval else 'train'
-    evaluate(lp.model_path, eval_name, aerial_visible_count=41, street_visible_count=16, wandb=wandb, logger=logger)
+    evaluate(lp.model_path, eval_name, aerial_visible_count=aerial_visible_count, street_visible_count=street_visible_count, wandb=wandb, logger=logger)
     logger.info("\nEvaluating complete.")

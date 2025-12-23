@@ -22,7 +22,7 @@ model_params: {
     pretrained_checkpoint: outputs/my_experiment/experiment6/test1/fine/point_cloud/iteration_40000,
     global_appearance: '',            # 全局外观模型路径（此处为空）
     dataset_name: my_experiment, # 数据集名称
-    scene_name: experiment6/test3/fine, # 场景名称/子目录，标注为fine(精细)阶段
+    scene_name: experiment6/test4/fine_withMask, # 场景名称/子目录，标注为fine(精细)阶段
     images: images,                   # 图像文件夹名称
     resolution: -1,                   # 图像分辨率缩放，-1表示使用原始分辨率
     white_background: False,          # 是否使用白色背景（通常False表示黑色背景）
