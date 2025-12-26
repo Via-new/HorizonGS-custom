@@ -935,7 +935,7 @@ if __name__ == "__main__":
 
     # Set default test and save iterations
     if args.test_iterations[0] == -1:
-        args.test_iterations = [i for i in range(5000, op.iterations + 1, 5000)]
+        args.test_iterations = [i for i in range(2000, op.iterations + 1, 2000)]
     if len(args.test_iterations) == 0 or args.test_iterations[-1] != op.iterations:
         args.test_iterations.append(op.iterations)
 

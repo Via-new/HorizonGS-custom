@@ -148,4 +148,6 @@ if __name__ == "__main__":
         lp, op, pp = parse_cfg(cfg)
         
     lp.model_path = os.path.dirname(os.path.dirname(args.checkpoint))
+    # [Fix] 强制转换为绝对路径，防止 save_mlp_checkpoints 中的 os.path.dirname() 报错
+    args.output_dir = os.path.abspath(args.output_dir)
     split_anchors(lp, op, pp, args)
