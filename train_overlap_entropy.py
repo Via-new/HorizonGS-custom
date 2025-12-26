@@ -650,7 +650,7 @@ if __name__ == "__main__":
     logger = get_logger(lp.model_path)
 
     if args.test_iterations[0] == -1:
-        args.test_iterations = [i for i in range(100, op.iterations + 1, 100)]
+        args.test_iterations = [i for i in range(5000, op.iterations + 1, 5000)]
     if len(args.test_iterations) == 0 or args.test_iterations[-1] != op.iterations:
         args.test_iterations.append(op.iterations)
 

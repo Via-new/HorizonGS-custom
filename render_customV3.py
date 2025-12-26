@@ -32,7 +32,11 @@ IS_RUNNING = True
 CLIENT_CONNECTED = False  # [新增] 连接状态标志
 old_terminal_attr = None 
 
-MOVE_STEP = 0.005
+# === [新增] ===
+DEBUG_LEVEL_COLOR_FLAG = False
+# =============
+
+MOVE_STEP = 0.002
 ANGLE_STEP = 0.05
 GLOBAL_SCALE_FACTOR = 1.0 
 TARGET_FPS = 60.0
@@ -65,7 +69,8 @@ def get_rotation_matrix(rx, ry, rz):
 
 # ================= 线程 1: 键盘监听 =================
 def keyboard_listener_thread():
-    print(">>> Keyboard Control Enabled (W/S/A/D/Q/E + I/K/J/L/U/O) <<<")
+    # === [修改提示信息] ===
+    print(">>> Keyboard: W/S/A/D/Q/E (Move), I/K/J/L/U/O (Rot), 'C' (Toggle Level Color) <<<")
     set_terminal_raw_mode()
     try:
         while IS_RUNNING:
@@ -78,6 +83,15 @@ def keyboard_listener_thread():
                 key = key.lower()
                 need_print = False 
                 
+                # === [新增: C键切换颜色模式] ===
+                if key == 'c':
+                    with STATE_LOCK:
+                        global DEBUG_LEVEL_COLOR_FLAG
+                        DEBUG_LEVEL_COLOR_FLAG = not DEBUG_LEVEL_COLOR_FLAG
+                        state_str = "ON" if DEBUG_LEVEL_COLOR_FLAG else "OFF"
+                        print(f"\r[Mode] Debug Level Color: {state_str} " + " "*20)
+                # ==============================
+
                 with STATE_LOCK:
                     if key == 'w': CAM_STATE['y'] -= MOVE_STEP; need_print = True
                     elif key == 's': CAM_STATE['y'] += MOVE_STEP; need_print = True
@@ -204,6 +218,14 @@ def render_loop(scene, gaussians, background, renderer_modules, pipe, img_queue,
             with STATE_LOCK:
                 curr_x, curr_y, curr_z = CAM_STATE['x'], CAM_STATE['y'], CAM_STATE['z']
                 curr_p, curr_yaw, curr_r = CAM_STATE['pitch'], CAM_STATE['yaw'], CAM_STATE['roll']
+                # === [新增: 同步 Debug 状态] ===
+                current_debug_mode = DEBUG_LEVEL_COLOR_FLAG
+                # =============================
+                
+            # === [新增: 应用到模型] ===
+            if hasattr(gaussians, 'debug_level_color'):
+                gaussians.debug_level_color = current_debug_mode
+            # =========================
             
             # 计算新位姿
             new_center = center_orig + np.array([curr_x, curr_y, curr_z], dtype=np.float32)

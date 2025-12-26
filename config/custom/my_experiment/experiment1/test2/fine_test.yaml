@@ -1,0 +1,119 @@
+# Model Parameters (模型参数)
+model_params: {
+    # 模型具体配置字典
+    model_config: {
+        'name': 'GaussianLoDModel',   # 使用的模型类名，LoD表示支持多细节层次(Level of Detail)
+        'kwargs': {
+            'fork': 2,                # 树结构的叉数（通常指八叉树或四叉树的分支因子）
+            'gs_attr': '2D',          # 高斯点的属性类型，这里可能是指扁平的2D表面片
+            'color_attr': 'RGB',      # 颜色属性格式
+            'feat_dim': 32,           # 神经渲染特征向量的维度（输入到MLP的维度）
+            'view_dim': 3,            # 视角方向的维度
+            'appearance_dim': 0,      # 外观嵌入向量维度（0表示不使用独立的外观编码）
+            'n_offsets': 10,          # 几何偏移量的数量（可能用于模拟微小的几何变动）
+            'voxel_size': 0.001,      # 基础体素大小，用于空间划分
+            'render_mode': 'RGB+ED',  # 渲染模式：RGB颜色 + Expected Depth (期望深度) 或 Edge
+            'standard_dist': 4.261476516723633, # 场景标准归一化距离
+            'aerial_levels': 2,       # 航拍视角的LoD层级数（航拍通常不需要太高层级）
+            'street_levels': 4        # 街景视角的LoD层级数（街景需要更多细节，层级更高）
+        }
+    },
+    # 预训练模型路径，这里指向了粗糙阶段(coarse)训练好的第60000次迭代的模型
+    pretrained_checkpoint: outputs/my_experiment/experiment1/test2/coarse/point_cloud/iteration_60000,
+    global_appearance: '',            # 全局外观模型路径（此处为空）
+    dataset_name: my_experiment, # 数据集名称
+    scene_name: experiment1/test2/fine_test, # 场景名称/子目录，标注为fine(精细)阶段
+    images: images,                   # 图像文件夹名称
+    resolution: -1,                   # 图像分辨率缩放，-1表示使用原始分辨率
+    white_background: False,          # 是否使用白色背景（通常False表示黑色背景）
+    random_background: False,         # 是否使用随机颜色背景
+    resolution_scales: [1.0],         # 多尺度训练的分辨率列表，[1.0]表示只用原图
+    data_device: cuda,                # 数据存储设备
+    eval: True,                      # 是否为评估模式（False表示训练模式）
+    ratio: 1,                         # 数据使用比例
+    data_format: colmap,              # 数据集格式（Colmap SfM输出格式）
+    add_mask: True,                  # 是否加载物体掩码
+    add_depth: False,                 # 是否加载真值深度图
+    add_aerial: True,                 # 是否包含航拍图像数据
+    add_street: True,                 # 是否包含街景图像数据
+    llffhold: 8,                      # 测试集划分比例（每8张图取1张作为测试集）
+    source_path: data/fusion/train    # 数据集源路径
+}
+
+# Pipeline Parameters (管线流程参数)
+pipeline_params: {
+    camera_balance: True,        # 是否开启相机平衡策略（平衡航拍和街景的采样频率）
+    camera_proportion: 1-1,      # 航拍与街景的采样比例，1-1表示 1:1
+    aerial_densify: False,       # 是否允许航拍区域的高斯点进行致密化（分裂/克隆），Fine阶段通常关闭
+    street_densify: True,        # 是否允许街景区域的高斯点进行致密化（街景细节多，通常允许）
+    weed_ratio: 0.000000,        # 剔除比例（用于根据某种度量裁剪点云，0表示不剔除）
+    add_prefilter: True,         # 是否开启CUDA预过滤优化
+    vis_step: 5000,              # 可视化/保存图片的迭代间隔
+    no_prefilter_step: 0         # 在第多少步停止预过滤（0可能表示一直开启或逻辑特定）
+}
+
+# Optimization Parameters (优化器参数)
+optim_params: {
+    iterations: 40000,               # 总训练迭代次数
+    position_lr_init: 0.000000,      # 位置学习率初始值（0表示Fine阶段不移动点的位置，只修外观）
+    position_lr_final: 0.000000,     # 位置学习率最终值
+    position_lr_delay_mult: 0.010000,# 位置学习率延迟乘数
+    position_lr_max_steps: 40000,    # 位置学习率调整的最大步数
+    
+    offset_lr_init: 0.001000,        # 几何偏移量的初始学习率（微调几何细节）
+    offset_lr_final: 0.000010,       # 几何偏移量的最终学习率
+    offset_lr_delay_mult: 0.010000,  # 偏移量学习率延迟乘数
+    offset_lr_max_steps: 40000,      # 偏移量学习率最大步数
+    
+    feature_lr: 0.007500,            # 特征向量的学习率（MLP输入特征）
+    scaling_lr: 0.007000,            # 缩放（Scale）属性的学习率
+    rotation_lr: 0.002000,           # 旋转（Rotation）属性的学习率
+    
+    mlp_opacity_lr_init: 0.002000,   # 不透明度MLP的初始学习率
+    mlp_opacity_lr_final: 0.000020,  # 不透明度MLP的最终学习率
+    mlp_opacity_lr_delay_mult: 0.010000,
+    mlp_opacity_lr_max_steps: 40000,
+    
+    mlp_cov_lr_init: 0.004000,       # 协方差MLP的初始学习率
+    mlp_cov_lr_final: 0.004000,      # 协方差MLP的最终学习率
+    mlp_cov_lr_delay_mult: 0.010000,
+    mlp_cov_lr_max_steps: 40000,
+    
+    mlp_color_lr_init: 0.008000,     # 颜色MLP的初始学习率
+    mlp_color_lr_final: 0.000050,    # 颜色MLP的最终学习率
+    mlp_color_lr_delay_mult: 0.010000,
+    mlp_color_lr_max_steps: 40000,
+    
+    appearance_lr_init: 0.000000,    # 外观嵌入的学习率（此处为0，不优化）
+    appearance_lr_final: 0.000000,
+    appearance_lr_delay_mult: 0.010000,
+    appearance_lr_max_steps: 40000,
+    
+    lambda_dssim: 0.200000,          # D-SSIM损失函数的权重
+    lambda_dreg: 0.010000,           # 正则化损失权重（通常用于控制高斯球大小）
+    lambda_sky_opa: 0.050000,        # 天空不透明度损失权重（强制天空区域透明）
+    lambda_opacity_entropy: 0.050000,# 不透明度熵损失权重（减少半透明云雾伪影）
+    lambda_normal: 0.000000,         # 法向量一致性损失权重
+    normal_start_iter: 7000,         # 法向量损失开始生效的迭代步数
+    lambda_dist: 0.000000,           # 畸变(Distortion)损失权重
+    dist_start_iter: 3000,           # 畸变损失开始生效的迭代步数
+    
+    start_stat: 0,                   # 开始统计梯度信息用于致密化的步数
+    update_from: 500,                # 开始执行致密化（分裂/克隆）的起始步数
+    update_interval: 100,            # 致密化操作的间隔步数
+    update_until: 20000,             # 停止致密化的步数（之后只优化参数不增减点）
+    overlap: False,                  # 是否检查重叠
+    densification: True,             # 总开关：是否启用致密化
+    growing_type: max,               # 生长类型策略
+    pruning_type: mean,              # 剪枝类型策略
+    min_opacity: 0.005000,           # 最小不透明度阈值（低于此值的点会被剪枝删除）
+    success_threshold: 0.800000,     # 成功阈值（可能与点云生长有关）
+    densify_grad_threshold: 0.015000,# 致密化梯度阈值（梯度大于此值时进行分裂或克隆）
+    update_ratio: 0.200000,          # 更新比率
+    extra_ratio: 0.250000,           # 额外比率
+    extra_up: 0.050000,              # 额外提升参数
+    
+    start_depth: 500,                # 开始使用深度监督损失的迭代步数
+    depth_l1_weight_init: 1.000000,  # 深度L1损失的初始权重
+    depth_l1_weight_final: 0.010000  # 深度L1损失的最终权重（随训练衰减）
+}

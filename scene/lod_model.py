@@ -48,6 +48,8 @@ class GaussianLoDModel(BasicModel):
         self.offset_denom = torch.empty(0)
         self.max_radii2D = torch.empty(0)
                 
+        # === [新增] ===
+        self.debug_level_color = False
         self.optimizer = None
         self.spatial_lr_scale = 0
         self.padding =  0.0
@@ -554,18 +556,9 @@ class GaussianLoDModel(BasicModel):
                 remove_duplicates[remove_duplicates_clone] = weed_mask
 
             if candidate_anchor.shape[0] > 0:
-                # =========== [Fix OOM Start] ===========
-                # 优化内存：避免显式创建巨大的重复张量，改用索引提取
-                # 1. 找到 mask 中为 True 的索引位置
-                valid_indices = torch.nonzero(candidate_mask).squeeze()
-                
-                # 2. 计算这些位置对应的 anchor 索引 (整除 n_offsets)
-                anchor_indices = torch.div(valid_indices, self.n_offsets, rounding_mode='floor')
-                
-                # 3. 直接提取特征
-                new_feat = self._anchor_feat[anchor_indices]
-                # =========== [Fix OOM End] ===========
+                new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
                 new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates]
+
 
                 new_scaling = torch.ones_like(candidate_anchor).repeat([1,2]).float().cuda()*voxel_size # *0.05
                 new_scaling = torch.log(new_scaling)
