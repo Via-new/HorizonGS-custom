@@ -191,6 +191,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     modules = __import__('scene')
     model_config = dataset.model_config
     gaussians = getattr(modules, model_config['name'])(**model_config['kwargs'])
+
+    # [Fix] 手动注入 model_path，以便 render.py 能找到 mask 文件
+    # 注意：这里的 start_checkpoint 就是你在 yaml 里配的 pretrained_checkpoint
+    if start_checkpoint:
+        # 如果是文件夹路径
+        if os.path.isdir(start_checkpoint):
+             gaussians.model_path = start_checkpoint
+        else:
+             gaussians.model_path = os.path.dirname(start_checkpoint)
+    else:
+        # 如果从头训练（虽然这不应该发生），设为 output 路径
+        gaussians.model_path = lp.model_path
     
     # ================= [DIAGNOSIS LOGIC START] =================
     logger.info("\n" + "="*20 + " Depth Params & COLMAP Consistency Check " + "="*20)
