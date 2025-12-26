@@ -612,12 +612,34 @@ class GaussianLoDModel(BasicModel):
             emd.save(os.path.join(path, 'embedding_appearance.pt'))
         self.train()
 
+    # def load_mlp_checkpoints(self, path):
+    #     self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
+    #     self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
+    #     self.mlp_color = torch.jit.load(os.path.join(path, 'color_mlp.pt')).cuda()
+    #     if self.appearance_dim > 0:
+    #         self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
     def load_mlp_checkpoints(self, path):
-        self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
-        self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
-        self.mlp_color = torch.jit.load(os.path.join(path, 'color_mlp.pt')).cuda()
+        # [Fix for Analysis] 
+        # 不要直接把 self.mlp_opacity 替换为 JIT 对象，
+        # 而是加载 JIT 对象后，把它的权重提取出来，加载到标准的 nn.Module 中。
+        # 这样既能兼容推理，又能支持训练和梯度 Hook 分析。
+        
+        # 1. 加载 Opacity
+        loaded_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
+        self.mlp_opacity.load_state_dict(loaded_opacity.state_dict())
+        
+        # 2. 加载 Covariance
+        loaded_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
+        self.mlp_cov.load_state_dict(loaded_cov.state_dict())
+        
+        # 3. 加载 Color
+        loaded_color = torch.jit.load(os.path.join(path, 'color_mlp.pt')).cuda()
+        self.mlp_color.load_state_dict(loaded_color.state_dict())
+        
+        # 4. 加载 Appearance (如果有)
         if self.appearance_dim > 0:
-            self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
+            loaded_app = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
+            self.embedding_appearance.load_state_dict(loaded_app.state_dict())
 
     def create_from_pretrained(self, pcd, spatial_lr_scale, model_path, logger):
         points = torch.tensor(pcd.points).float().cuda()
