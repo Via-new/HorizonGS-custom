@@ -3,79 +3,134 @@
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
 #
-# Modified for HorizonGS Source-Aware Rendering (Scheme 1)
+# This software is free for non-commercial, research and evaluation use 
+# under the terms of the LICENSE.md file.
 #
-
+# For inquiries contact  george.drettakis@inria.fr
+#
 import torch
 import math
-import os
 import gsplat
 from gsplat.cuda._wrapper import fully_fused_projection, fully_fused_projection_2dgs
 
-def render(viewpoint_camera, pc, pipe, bg_color):
+def render(viewpoint_camera, pc, pipe, bg_color, override_mask=None, override_color=None):
     """
     Render the scene. 
     
-    Background tensor (bg_color) must be on GPU!
+    Args:
+        override_mask (Tensor, optional): If provided, ONLY renders anchors where mask is True.
+        override_color (Tensor, optional): [N_anchors, 3] RGB Tensor (values 0-1).
+                                           If provided, forces visible points to use this color.
+                                           Useful for visualizing debug attributes (e.g. Red/Blue/Green conflicts).
     """
-    
-    # A. 尝试加载 Mask (Lazy Loading)
-    if not hasattr(pc, "source_mask"):
-        # [Fix] 增加鲁棒性检查
-        model_path = getattr(pc, "model_path", None)
-        
-        if model_path and os.path.exists(os.path.join(model_path, "anchor_source_mask.pt")):
-            mask_path = os.path.join(model_path, "anchor_source_mask.pt")
-            try:
-                print(f"[Render] Loading Source Mask from {mask_path}")
-                pc.source_mask = torch.load(mask_path).to("cuda")
-            except Exception as e:
-                print(f"[Render] Warning: Failed to load mask: {e}")
-                pc.source_mask = None
-        else:
-            # 如果找不到 model_path 或文件不存在
-            # print("[Render] No source mask found. Skipping filtering.")
-            pc.source_mask = None
-
-    # 计算基于源的过滤掩码 (Source Filter)
-    source_filter = None
-    if getattr(pc, "source_mask", None) is not None:
-        # 判断相机类型
-        img_name = viewpoint_camera.image_name.lower()
-        is_aerial = "aerial" in img_name
-        
-        # 0=Air, 1=Street, 2=Shared
-        if is_aerial:
-            # 航拍相机：不看 Street(1)
-            source_filter = (pc.source_mask != 1)
-        else:
-            # 街景相机：不看 Air(0)
-            source_filter = (pc.source_mask != 0)
-    # =============================================================
-
     if pc.explicit_gs:
         pc.set_gs_mask(viewpoint_camera.camera_center, viewpoint_camera.resolution_scale)
         visible_mask = pc._gs_mask
-        
-        # [应用过滤]
-        if source_filter is not None:
-            # 确保长度一致 (Explicit 模式下 mask 对应的是 GS)
-            if source_filter.shape[0] == visible_mask.shape[0]:
-                visible_mask = visible_mask & source_filter
-                
         xyz, color, opacity, scaling, rot, sh_degree, selection_mask = pc.generate_explicit_gaussians(visible_mask)
     else:
         pc.set_anchor_mask(viewpoint_camera.camera_center, viewpoint_camera.resolution_scale)
         visible_mask = prefilter_voxel(viewpoint_camera, pc).squeeze() if pipe.add_prefilter else pc._anchor_mask    
         
-        # [应用过滤] 核心修改点
-        if source_filter is not None:
-            # 确保长度一致 (Implicit 模式下 mask 对应的是 Anchor)
-            if source_filter.shape[0] == visible_mask.shape[0]:
-                visible_mask = visible_mask & source_filter
-        
-        # 将过滤后的 mask 传给解码器，这样被屏蔽的锚点根本不会生成高斯球
+        # ================= [Filter by Override Mask] =================
+        if override_mask is not None:
+            # Intersection: Visible AND in Override Mask
+            visible_mask = visible_mask & override_mask
+        # =============================================================
+
         xyz, offset, color, opacity, scaling, rot, sh_degree, selection_mask = pc.generate_neural_gaussians(viewpoint_camera, visible_mask)
+
+    # ================= [Color Overrides] =================
+    
+    # 1. Priority: Explicit Color Override (e.g. for Multi-color Conflict Debugging)
+    if override_color is not None:
+        try:
+            # Ensure override_color is on the correct device
+            if override_color.device != visible_mask.device:
+                override_color = override_color.to(visible_mask.device)
+
+            # A. Extract colors for currently visible anchors
+            visible_colors = override_color[visible_mask] # [N_visible_anchors, 3]
+
+            # B. Handle Neural Expansion (1 Anchor -> k Gaussians)
+            if not pc.explicit_gs:
+                k = getattr(pc, "n_offsets", 1)
+                # Expand colors: [ColorA, ColorB] -> [ColorA, ColorA..., ColorB, ColorB...]
+                visible_colors = visible_colors.repeat_interleave(k, dim=0) 
+                
+                # C. Handle Pruning (if generate_neural_gaussians dropped some offsets)
+                if selection_mask is not None:
+                    # Check shape compatibility
+                    if visible_colors.shape[0] != xyz.shape[0] and selection_mask.shape[0] == visible_colors.shape[0]:
+                        visible_colors = visible_colors[selection_mask]
+            
+            # D. Final Shape Check
+            if visible_colors.shape[0] == xyz.shape[0]:
+                # Convert RGB to SH DC component
+                # SH_0 = (RGB - 0.5) / C0
+                SH_C0 = 0.28209479177387814
+                
+                # Apply override
+                color = (visible_colors - 0.5) / SH_C0
+                color = color.unsqueeze(1) # [N_gaussians, 1, 3]
+                sh_degree = 0
+            else:
+                pass 
+
+        except Exception as e:
+            print(f"[Render Error] Failed to apply override_color: {e}")
+
+    # 2. Secondary: Debug Level Color (Only if not already overridden)
+    elif getattr(pc, "debug_level_color", False):
+        try:
+            # 1. 获取可见锚点的 Level 数据
+            valid_levels = pc.get_level[visible_mask].flatten() 
+
+            # 2. 对齐 Level 数量到高斯球数量
+            if not pc.explicit_gs:
+                k = pc.n_offsets
+                potential_levels = valid_levels.repeat_interleave(k)
+                if selection_mask is not None:
+                    gauss_levels = potential_levels[selection_mask]
+                else:
+                    gauss_levels = potential_levels
+            else:
+                if selection_mask is not None and selection_mask.shape[0] == valid_levels.shape[0]:
+                    gauss_levels = valid_levels[selection_mask]
+                else:
+                    gauss_levels = valid_levels
+
+            # 3. 检查形状匹配
+            if gauss_levels.shape[0] == xyz.shape[0]:
+                SH_C0 = 0.28209479177387814
+                
+                def get_sh_color(r, g, b):
+                    return torch.tensor([
+                        (r - 0.5) / SH_C0, 
+                        (g - 0.5) / SH_C0, 
+                        (b - 0.5) / SH_C0
+                    ], device=xyz.device)
+
+                debug_colors = torch.zeros_like(xyz) 
+
+                # Level 0 -> Red
+                mask_l0 = (gauss_levels == 0)
+                if mask_l0.any(): debug_colors[mask_l0] = get_sh_color(1.0, 0.0, 0.0)
+                
+                # Level 1 -> Blue
+                mask_l1 = (gauss_levels == 1)
+                if mask_l1.any(): debug_colors[mask_l1] = get_sh_color(0.0, 0.0, 1.0)
+                
+                # Level 2+ -> Green
+                mask_l2 = (gauss_levels >= 2)
+                if mask_l2.any(): debug_colors[mask_l2] = get_sh_color(0.0, 1.0, 0.0)
+
+                color = debug_colors.unsqueeze(1) 
+                sh_degree = 0
+            else:
+                pass 
+        except Exception as e:
+            print(f"[DebugColor Error] {e}")
+    # ================================================================
 
     # Set up rasterization configuration
     K = torch.tensor([
@@ -216,7 +271,8 @@ def prefilter_voxel(viewpoint_camera, pc):
         densifications = (
             torch.zeros((C, N, 2), dtype=means.dtype, device="cuda")
         )
-        # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
+        # Project Gaussians to 2D. 
+        # [Fixed]: Removed calc_compensations argument for 2DGS
         proj_results = fully_fused_projection_2dgs(
             means,
             quats,
