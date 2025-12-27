@@ -30,15 +30,41 @@ def render(viewpoint_camera, pc, pipe, bg_color):
             # 获取相机类型，默认为 aerial 以防万一
             cam_type = getattr(viewpoint_camera, "image_type", "aerial")
             
+            # --- [新增] 埋点统计 (调试用) ---
+            # 统计一下在进行 Mask 过滤前，视锥内包含多少种类的点
+            # n_src0 = (visible_mask & (pc.anchor_source_mask == 0)).sum().item()
+            # n_src1 = (visible_mask & (pc.anchor_source_mask == 1)).sum().item()
+            # print(f"\n[DEBUG] Before Filter ({cam_type}): Air-Only={n_src0}, Street-Only={n_src1}")
+            # -----------------------------
+
             if cam_type == "aerial":
-                # 航拍视角：看 (Source==0) 和 (Source==2) -> 屏蔽 (Source==1)
+                # 航拍视角：屏蔽 (Source==1)
                 valid_source = (pc.anchor_source_mask != 1)
                 visible_mask = visible_mask & valid_source
             elif cam_type == "street":
-                # 街景视角：看 (Source==1) 和 (Source==2) -> 屏蔽 (Source==0)
+                # 街景视角：屏蔽 (Source==0)
                 valid_source = (pc.anchor_source_mask != 0)
                 visible_mask = visible_mask & valid_source
-            # 其他情况（如 unknown）默认全看，不进行额外过滤
+            
+            # --- [新增] 验证过滤结果 (核心) ---
+            # 只有当这里打印出 0 时，才说明策略生效了！
+            if cam_type == "aerial":
+                leak_count = (visible_mask & (pc.anchor_source_mask == 1)).sum().item()
+                if leak_count > 0:
+                    print(f"❌ [ERROR] Aerial View contains {leak_count} Street-Only points!")
+                else:
+                    # 为了不刷屏，可以每隔几帧打印一次，或者只打印一次
+                    # print(f"✅ [OK] Aerial View: 0 Street-Only points.")
+                    pass
+            elif cam_type == "street":
+                leak_count = (visible_mask & (pc.anchor_source_mask == 0)).sum().item()
+                if leak_count > 0:
+                    print(f"❌ [ERROR] Street View contains {leak_count} Air-Only points!")
+                else:
+                    # print(f"✅ [OK] Street View: 0 Air-Only points.")
+                    pass
+            # -------------------------------
+
         # ================= [Scheme 1 核心修改 End] =================
 
         xyz, offset, color, opacity, scaling, rot, sh_degree, selection_mask = pc.generate_neural_gaussians(viewpoint_camera, visible_mask)

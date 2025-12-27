@@ -190,70 +190,143 @@ class CameraPoseCorrection(nn.Module):
 
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, wandb=None, logger=None, ply_path=None):
     """
-    Main training function.
+    Main training function (Fixed for Scheme 1 & Type Errors).
     """
     first_iter = 0
-    # Prepare output folder
-    # [Modified] Pass logger to prepare_output_and_logger
     tb_writer = prepare_output_and_logger(dataset, logger)
 
-    # Dynamic import
     modules = __import__('scene')
     model_config = dataset.model_config
     gaussians = getattr(modules, model_config['name'])(**model_config['kwargs'])
     
-    # Load checkpoint
+    # ================= [FIX START: Super Sanitizer] =================
+    if logger: logger.info(">>> Running Super Sanitizer on Opt Params...")
+    # 需要强制转换的关键参数列表
+    target_attrs = [
+        "position_lr_init", "position_lr_final", "position_lr_delay_mult", "position_lr_max_steps",
+        "feature_lr", "opacity_lr", "scaling_lr", "rotation_lr", "percent_dense", "lambda_dssim"
+    ]
+    
+    for attr in target_attrs:
+        if hasattr(opt, attr):
+            val = getattr(opt, attr)
+            new_val = val
+            
+            # 1. 处理 Tensor (包括 0-dim 和 1-dim)
+            if isinstance(val, torch.Tensor):
+                if val.numel() > 1:
+                    new_val = val.mean().item() # 如果是多个值，取平均
+                else:
+                    new_val = val.item()
+            
+            # 2. 处理 List/Tuple (取第一个元素)
+            elif isinstance(val, (list, tuple)):
+                if len(val) > 0:
+                    new_val = val[0]
+                    # 如果取出来还是 Tensor，递归处理一下
+                    if isinstance(new_val, torch.Tensor):
+                        new_val = new_val.item()
+            
+            # 3. 处理 Numpy
+            elif hasattr(val, 'item'): 
+                new_val = val.item()
+
+            # 4. 强制转 float
+            try:
+                final_val = float(new_val)
+                setattr(opt, attr, final_val)
+                # 只有当值发生变化或者是Tensor时才打印，避免刷屏
+                if type(val) != float:
+                    if logger: logger.info(f"   [Fixed] opt.{attr}: {type(val)} -> {type(final_val)} ({final_val})")
+            except Exception as e:
+                if logger: logger.warning(f"   [Failed] Could not sanitize opt.{attr}: {e}")
+    # ================= [FIX END] =================
+
+    # 1. Initial setup
+    gaussians.training_setup(opt)
+
+    # ================= [Modified Checkpoint Loading Logic] =================
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
+        is_restored = False
         
-        # ================= [Scheme 1 修改 Start] =================
-        # 尝试加载 anchor_source_mask.pt
+        # 1. 尝试正常加载 .pth
+        try:
+            (model_params, loaded_iter) = torch.load(checkpoint)
+            
+            # [FIX] 强制转为 Python int，防止 Tensor 类型导致后续报错
+            if isinstance(loaded_iter, torch.Tensor):
+                loaded_iter = loaded_iter.item()
+            first_iter = int(loaded_iter)
+
+            gaussians.restore(model_params, opt)
+            
+            if logger: logger.info(f"[Loader] Successfully restored from .pth: {checkpoint} at iter {first_iter}")
+            is_restored = True
+        except Exception as e:
+            if logger: logger.warning(f"[Loader] Standard .pth restore failed: {e}")
+            if logger: logger.info("[Loader] Attempting Fallback to PLY (Scheme 1 mode)...")
+        
+        # 2. Fallback: 如果 .pth 失败，尝试直接加载 PLY
+        if not is_restored:
+            chk_dir = os.path.dirname(checkpoint)
+            ply_path = os.path.join(chk_dir, "point_cloud.ply")
+            
+            if os.path.exists(ply_path):
+                if logger: logger.info(f"[Loader] Loading geometry from PLY: {ply_path}")
+                gaussians.load_ply(ply_path)
+                
+                # [CRITICAL] 几何改变后，必须重新初始化优化器
+                if logger: logger.info("[Loader] Resetting Optimizer for new split geometry...")
+                gaussians.training_setup(opt)
+                
+                first_iter = 0 # 重置为 0
+                is_restored = True
+            else:
+                if logger: logger.error(f"[Error] PLY file not found at {ply_path}. Cannot recover.")
+                sys.exit(1)
+
+        # 3. [Scheme 1] 加载 Mask (独立于加载方式)
         chk_dir = os.path.dirname(checkpoint)
         mask_path = os.path.join(chk_dir, "anchor_source_mask.pt")
         if os.path.exists(mask_path):
-            logger.info(f"[Scheme 1] Found Anchor Source Mask at: {mask_path}")
-            # 加载 Mask 并绑定到 gaussians 对象上
-            # 注意：split_anchors.py 生成的 mask 在 CUDA 上，这里直接加载
+            if logger: logger.info(f"[Scheme 1] Found Anchor Source Mask at: {mask_path}")
             mask_tensor = torch.load(mask_path, map_location="cuda")
-            
-            # 校验形状是否匹配
-            if mask_tensor.shape[0] != gaussians.get_anchor.shape[0]:
-                logger.warning(f"[Scheme 1] Mask shape {mask_tensor.shape[0]} != Anchor shape {gaussians.get_anchor.shape[0]}. Ignoring Mask!")
-                gaussians.anchor_source_mask = None
-            else:
+            if mask_tensor.shape[0] == gaussians.get_anchor.shape[0]:
                 gaussians.anchor_source_mask = mask_tensor
-                logger.info(f"[Scheme 1] Mask loaded successfully. Aerial(0)/Street(1)/Shared(2) filtering enabled.")
+                if logger: logger.info(f"[Scheme 1] Mask loaded successfully.")
+            else:
+                if logger: logger.warning(f"[Scheme 1] Mask shape mismatch! Ignoring.")
+                gaussians.anchor_source_mask = None
         else:
-            logger.info("[Scheme 1] No Anchor Source Mask found. Running in standard mode.")
+            if logger: logger.info("[Scheme 1] No Anchor Source Mask found. Running in standard mode.")
             gaussians.anchor_source_mask = None
-    # ================= [Scheme 1 修改 End] =================
+    # =======================================================================
+    
     # ================= [DIAGNOSIS LOGIC START] =================
-    logger.info("\n" + "="*20 + " Depth Params & COLMAP Consistency Check " + "="*20)
+    if logger: logger.info("\n" + "="*20 + " Depth Params & COLMAP Consistency Check " + "="*20)
     json_path = os.path.join(dataset.source_path, "sparse", "0", "depth_params.json")
     
     if os.path.exists(json_path):
-        logger.info(f"[JSON] File found: {json_path}")
+        if logger: logger.info(f"[JSON] File found: {json_path}")
         try:
             with open(json_path, 'r') as f:
                 json.load(f)
-            logger.info(f"[JSON] File format correct.")
+            if logger: logger.info(f"[JSON] File format correct.")
         except Exception as e:
-            logger.error(f"[JSON] File corrupted: {e}")
+            if logger: logger.error(f"[JSON] File corrupted: {e}")
     else:
-        logger.error(f"[JSON] Warning: {json_path} not found. Error will occur if add_depth is enabled.")
-    logger.info("="*60 + "\n")
+        if logger: logger.error(f"[JSON] Warning: {json_path} not found. Error will occur if add_depth is enabled.")
+    if logger: logger.info("="*60 + "\n")
     # ================= [DIAGNOSIS LOGIC END] =================
 
     # Initialize scene
     scene = Scene(dataset, gaussians, shuffle=False, logger=logger, weed_ratio=pipe.weed_ratio)
 
     # ================= [Fix Start] Manual Camera Type Fix =================
-    logger.info("Fixing camera types based on filenames...")
+    if logger: logger.info("Fixing camera types based on filenames...")
     aerial_count = 0
     street_count = 0
     
-    # [NEW] Count loaded Depth and Masks
     depth_loaded_count = 0
     mask_loaded_count = 0
     total_train_cams = len(scene.getTrainCameras())
@@ -270,51 +343,38 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             cam.image_type = "aerial"
             aerial_count += 1
         
-        # [NEW] Check Depth
         if cam.invdepthmap is not None:
             depth_loaded_count += 1
-            
-        # [NEW] Check Mask
         if cam.alpha_mask is not None:
             mask_loaded_count += 1
             
-    logger.info(f"Manual Classification Result: Aerial={aerial_count}, Street={street_count}")
-    
-    # [NEW] Print Depth and Mask statistics
-    logger.info("-" * 50)
-    logger.info(f"Data Loading Integrity Check (Train Set):")
-    logger.info(f"  Total Cameras : {total_train_cams}")
-    logger.info(f"  Depth Maps    : {depth_loaded_count} / {total_train_cams} ({(depth_loaded_count/total_train_cams)*100:.1f}%)")
-    logger.info(f"  Masks         : {mask_loaded_count} / {total_train_cams} ({(mask_loaded_count/total_train_cams)*100:.1f}%)")
+    if logger: 
+        logger.info(f"Manual Classification Result: Aerial={aerial_count}, Street={street_count}")
+        logger.info("-" * 50)
+        logger.info(f"Data Loading Integrity Check (Train Set):")
+        logger.info(f"  Total Cameras : {total_train_cams}")
+        logger.info(f"  Depth Maps    : {depth_loaded_count} / {total_train_cams} ({(depth_loaded_count/total_train_cams)*100:.1f}%)")
+        logger.info(f"  Masks         : {mask_loaded_count} / {total_train_cams} ({(mask_loaded_count/total_train_cams)*100:.1f}%)")
     
     if dataset.add_depth and depth_loaded_count < total_train_cams:
-        logger.warning(f"Warning: add_depth enabled, but {total_train_cams - depth_loaded_count} images failed to load depth maps!")
+        if logger: logger.warning(f"Warning: add_depth enabled, but {total_train_cams - depth_loaded_count} images failed to load depth maps!")
     elif dataset.add_depth:
-        logger.info("Success: All depth maps loaded.")
+        if logger: logger.info("Success: All depth maps loaded.")
 
     if dataset.add_mask and mask_loaded_count < total_train_cams:
-        logger.warning(f"Warning: add_mask enabled, but {total_train_cams - mask_loaded_count} images failed to load masks!")
+        if logger: logger.warning(f"Warning: add_mask enabled, but {total_train_cams - mask_loaded_count} images failed to load masks!")
     elif dataset.add_mask:
-        logger.info("Success: All masks loaded.")
-    logger.info("-" * 50)
+        if logger: logger.info("Success: All masks loaded.")
+    if logger: logger.info("-" * 50)
 
-    # Safety check
     if street_count == 0 and pipe.camera_balance:
-        logger.warning("WARNING: No street cameras found even after manual fix! Disabling camera_balance.")
+        if logger: logger.warning("WARNING: No street cameras found even after manual fix! Disabling camera_balance.")
         pipe.camera_balance = False
     
     scene.add_aerial = (aerial_count > 0)
     scene.add_street = (street_count > 0)
     # ================= [Fix End] =================
 
-    # 1. Initial setup
-    gaussians.training_setup(opt)
-    
-    # Load checkpoint
-    if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
-    
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
     
@@ -330,13 +390,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_Ll1depth_for_log = 0.0
     densify_cnt = 0
     
-    # [NEW] Optimized progress bar
+    # [FIX] Ensure first_iter is valid for range
+    first_iter = int(first_iter)
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress", leave=True, dynamic_ncols=True, mininterval=0.5)
     first_iter += 1
     modules = __import__('gaussian_renderer')
     
     # --- Training Loop ---
     for iteration in range(first_iter, opt.iterations + 1):        
+        # [FIX] Force iteration to be int inside the loop
+        iteration = int(iteration)
+
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -344,7 +408,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 net_image_bytes = None
                 custom_cam, do_training, pipe.add_prefilter, keep_alive = network_gui.receive()
                 if custom_cam != None:
-                    net_image = getattr(modules, 'render')(custom_cam, gaussians, pipe, scene.background)["render"]
+                    # [Scheme 1] Use custom renderer for GUI
+                    net_image = custom_renderer.render(custom_cam, gaussians, pipe, scene.background)["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -376,8 +441,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # --- Forward ---
-        # [Scheme 1 修改] 使用 custom_renderer (即 render_scheme1)
-        # 替换: render_pkg = getattr(modules, 'render')(viewpoint_cam, gaussians, pipe, scene.background)
+        # [Scheme 1 修改] 使用 custom_renderer
         render_pkg = custom_renderer.render(viewpoint_cam, gaussians, pipe, scene.background)
         image, scaling, alpha = render_pkg["render"], render_pkg["scaling"], render_pkg["render_alphas"]
 
@@ -456,14 +520,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, getattr(modules, 'render'), (pipe, scene.background), wandb, logger)
+            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, custom_renderer.render, (pipe, scene.background), wandb, logger)
             
             if (iteration in saving_iterations):
-                # [NEW] Log saving info to outputs.log
-                msg = f"[ITER {iteration}] Saving Gaussians"
+                msg = f"[ITER {iteration}] Saving Checkpoint"
                 tqdm.write(msg)
                 if logger: logger.info(msg)
                 scene.save(iteration)
+                # Backup current mask if needed
+                if gaussians.anchor_source_mask is not None:
+                     torch.save(gaussians.anchor_source_mask, os.path.join(scene.model_path, "anchor_source_mask.pt"))
 
             if iteration % pipe.vis_step == 0 or iteration == 1:
                 other_img = []
@@ -490,6 +556,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 os.makedirs(vis_path, exist_ok=True)
                 torchvision.utils.save_image(grid, os.path.join(vis_path, f"{iteration:05d}_{viewpoint_cam.colmap_id:03d}.png"))
             
+            # Densification Logic
             if iteration < opt.update_until and iteration > opt.start_stat:
                 if  (viewpoint_cam.image_type == "aerial" and pipe.aerial_densify) \
                     or (viewpoint_cam.image_type == "street" and pipe.street_densify) :
@@ -499,6 +566,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 if opt.densification and iteration > opt.update_from and densify_cnt > 0 and densify_cnt % opt.update_interval == 0:
                     if dataset.pretrained_checkpoint != "":
                         gaussians.roll_back()
+                    # [Caution] Densification might mess up the mask indices!
                     gaussians.run_densify(opt, iteration)
             
             elif iteration == opt.update_until:
@@ -514,7 +582,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 pipe.add_prefilter = False
 
             if (iteration in checkpoint_iterations):
-                # [NEW] Log saving info to outputs.log
                 msg = f"[ITER {iteration}] Saving Checkpoint"
                 tqdm.write(msg)
                 if logger: logger.info(msg)
