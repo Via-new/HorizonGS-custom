@@ -19,10 +19,10 @@ model_params: {
         }
     },
     # 预训练模型路径，这里指向了粗糙阶段(coarse)训练好的第60000次迭代的模型
-    pretrained_checkpoint: debug_split_model,
+    pretrained_checkpoint: outputs/my_experiment/experiment5/test2/coarse/point_cloud/iteration_60000,
     global_appearance: '',            # 全局外观模型路径（此处为空）
     dataset_name: my_experiment, # 数据集名称
-    scene_name: experiment7/test1/fine, # 场景名称/子目录，标注为fine(精细)阶段
+    scene_name: experiment5/test2/fine, # 场景名称/子目录，标注为fine(精细)阶段
     images: images,                   # 图像文件夹名称
     resolution: -1,                   # 图像分辨率缩放，-1表示使用原始分辨率
     white_background: False,          # 是否使用白色背景（通常False表示黑色背景）
@@ -108,7 +108,7 @@ optim_params: {
     pruning_type: mean,              # 剪枝类型策略
     min_opacity: 0.005000,           # 最小不透明度阈值（低于此值的点会被剪枝删除）
     success_threshold: 0.800000,     # 成功阈值（可能与点云生长有关）
-    densify_grad_threshold: 10000,# 致密化梯度阈值（梯度大于此值时进行分裂或克隆）
+    densify_grad_threshold: 0.015000,# 致密化梯度阈值（梯度大于此值时进行分裂或克隆）
     update_ratio: 0.200000,          # 更新比率
     extra_ratio: 0.250000,           # 额外比率
     extra_up: 0.050000,              # 额外提升参数

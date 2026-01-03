@@ -23,7 +23,10 @@ os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in res
 print(f"Using GPU: {os.environ['CUDA_VISIBLE_DEVICES']}")
 
 # ================= 全局变量 =================
-CAM_STATE = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'pitch': 0.0, 'yaw': 0.0, 'roll': 0.0}
+CAM_STATE = {
+    'x': 0.0, 'y': 0.0, 'z': 0.0,
+    'pitch': 0.0, 'yaw': 0.0, 'roll': 0.0
+}
 STATE_LOCK = threading.Lock()
 IS_RUNNING = True
 CLIENT_CONNECTED = False 
@@ -42,11 +45,11 @@ CONFLICT_SUB_MASKS = {}            # { 'Green': mask, 'Red': mask ... }
 CURRENT_SUB_MODE_IDX = 0           # 当前显示的子类别索引
 SUB_MODES = ["ALL"]                # 子类别列表
 
-FORCE_OPAQUE = False               # [修复] 默认为 False，保证基础渲染正常！
+FORCE_OPAQUE = False               # 默认为 False
 # =====================
 
-MOVE_STEP = 0.01
-ANGLE_STEP = 0.1
+MOVE_STEP = 0.002
+ANGLE_STEP = 0.05
 GLOBAL_SCALE_FACTOR = 1.0 
 TARGET_FPS = 60.0
 
@@ -119,16 +122,16 @@ def keyboard_listener_thread():
                 need_print_cam = False
                 
                 with STATE_LOCK:
-                    global DEBUG_LEVEL_COLOR_FLAG, DEBUG_CONFLICT_CLASS_FLAG
-                    global CURRENT_SUB_MODE_IDX, FORCE_OPAQUE, DEBUG_CONFLICT_RED_FLAG, DEBUG_CONFLICT_NORMAL_FLAG
+                    global DEBUG_LEVEL_COLOR_FLAG, DEBUG_CONFLICT_RED_FLAG, DEBUG_CONFLICT_NORMAL_FLAG, DEBUG_CONFLICT_CLASS_FLAG
+                    global CURRENT_SUB_MODE_IDX, FORCE_OPAQUE
                     
                     # 'C': Level Color
                     if key == 'c':
                         DEBUG_LEVEL_COLOR_FLAG = not DEBUG_LEVEL_COLOR_FLAG
                         if DEBUG_LEVEL_COLOR_FLAG: 
-                            DEBUG_CONFLICT_CLASS_FLAG = False
                             DEBUG_CONFLICT_RED_FLAG = False
                             DEBUG_CONFLICT_NORMAL_FLAG = False
+                            DEBUG_CONFLICT_CLASS_FLAG = False
                         need_print_mode = True
 
                     # 'B': Conflict Class Mode (Main Switch)
@@ -137,7 +140,7 @@ def keyboard_listener_thread():
                             print(f"\r[Err] No conflict mask! " + " "*30)
                         else:
                             DEBUG_CONFLICT_CLASS_FLAG = not DEBUG_CONFLICT_CLASS_FLAG
-                            if DEBUG_CONFLICT_CLASS_FLAG: 
+                            if DEBUG_CONFLICT_CLASS_FLAG:
                                 DEBUG_LEVEL_COLOR_FLAG = False
                                 DEBUG_CONFLICT_RED_FLAG = False
                                 DEBUG_CONFLICT_NORMAL_FLAG = False
@@ -251,13 +254,32 @@ def load_scene_once(dataset, pipe, iteration, ape_code, explicit):
         else: pipe.add_prefilter = True
             
         scene_modules = __import__('scene')
-        renderer_modules = __import__('gaussian_renderer') 
-        
+        # [修改] 使用 Scheme 1 渲染器
+        from gaussian_renderer import render_scheme1 as renderer_modules
+        print("[INFO] Loaded Scheme 1 Renderer (Mask-aware)")
+
         model_config = dataset.model_config
         model_config['kwargs']['ape_code'] = ape_code
         gaussians = getattr(scene_modules, model_config['name'])(**model_config['kwargs'])
         scene = scene_modules.Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, explicit=explicit)
         gaussians.eval()
+
+        # 加载 Scheme 1 的 Mask (如果有)
+        mask_path = os.path.join(dataset.model_path, "point_cloud", f"iteration_{iteration}", "anchor_source_mask.pt")
+        # 尝试不同路径
+        if not os.path.exists(mask_path):
+             mask_path = os.path.join(dataset.model_path, "anchor_source_mask.pt")
+
+        if os.path.exists(mask_path):
+            print(f"[INFO] Found Anchor Source Mask: {mask_path}")
+            mask_tensor = torch.load(mask_path, map_location="cuda")
+            if mask_tensor.shape[0] == gaussians.get_anchor.shape[0]:
+                gaussians.anchor_source_mask = mask_tensor
+                print("[INFO] Mask loaded successfully.")
+            else:
+                print(f"[WARN] Mask shape {mask_tensor.shape} mismatch with anchors {gaussians.get_anchor.shape}!")
+        else:
+             print("[WARN] No Anchor Source Mask found. Scheme 1 will run in default mode (All shared).")
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -269,7 +291,7 @@ def render_loop(scene, gaussians, background, renderer_modules, pipe, img_queue,
     with STATE_LOCK:
         CAM_STATE = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'pitch': 0.0, 'yaw': 0.0, 'roll': 0.0}
 
-    # --- 寻找初始视角 (您原有的逻辑) ---
+    # Find initial view
     all_cameras = scene.getTrainCameras() + scene.getTestCameras()
     selected_view = None
     
@@ -289,7 +311,6 @@ def render_loop(scene, gaussians, background, renderer_modules, pipe, img_queue,
         elif all_cameras: selected_view = all_cameras[0]
         else: return # No cameras
     
-    # view = aerial_views[0]
     view = selected_view
     print(f"Start Rendering View: {view.image_name}")
 
@@ -325,7 +346,6 @@ def render_loop(scene, gaussians, background, renderer_modules, pipe, img_queue,
             override_color = None
             
             if CONFLICT_MASK_ALL is not None:
-                # 1. Determine Mask based on mode
                 if show_conflict:
                     if sub_mode_name == "ALL":
                         override_mask = CONFLICT_MASK_ALL
@@ -334,7 +354,6 @@ def render_loop(scene, gaussians, background, renderer_modules, pipe, img_queue,
                 elif show_red or show_norm:
                     override_mask = CONFLICT_MASK_ALL
 
-                # 2. Set Color
                 if show_conflict:
                     if CONFLICT_COLORS is not None:
                         override_color = CONFLICT_COLORS
@@ -359,7 +378,7 @@ def render_loop(scene, gaussians, background, renderer_modules, pipe, img_queue,
             view.world_view_transform_inv = view.world_view_transform.inverse()
             view.camera_center = view.world_view_transform_inv[3, :3]
 
-            # Call Render
+            # Call Render (Now using Scheme 1)
             render_pkg = getattr(renderer_modules, 'render')(
                 view, gaussians, pipe, background,
                 override_mask=override_mask,
@@ -424,13 +443,6 @@ if __name__ == "__main__":
                 indices = loaded_data['indices'].to("cuda")
                 colors = loaded_data['colors'].to("cuda") # [N_conflict, 3] float
                 
-                # [Fix] Ensure indices are within bounds
-                valid_mask = (indices >= 0) & (indices < num_anchors)
-                if not valid_mask.all():
-                    print(f"[Warn] Found { (~valid_mask).sum().item() } invalid indices out of {indices.shape[0]}. Filtering...")
-                    indices = indices[valid_mask]
-                    colors = colors[valid_mask]
-
                 CONFLICT_MASK_ALL[indices] = True
                 CONFLICT_COLORS[indices] = colors
                 

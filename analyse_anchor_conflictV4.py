@@ -1,5 +1,5 @@
 #
-# HorizonGS Anchor Conflict Analysis Tool V3.5 (Z-Min Filter + Road Debug)
+# HorizonGS Anchor Conflict Analysis Tool V4.0 (Scheme 1 Support)
 # 
 import os
 import torch
@@ -18,6 +18,15 @@ from scene import Scene
 from utils.general_utils import safe_state, parse_cfg 
 from utils.loss_utils import l1_loss, ssim
 from utils.graphics_utils import BasicPointCloud
+
+# ================= [修改 1: 导入 Scheme 1 渲染器] =================
+try:
+    from gaussian_renderer import render_scheme1 as custom_renderer
+    print("[INFO] Using Scheme 1 Renderer (Mask-aware)")
+except ImportError:
+    import gaussian_renderer as custom_renderer
+    print("[WARN] Scheme 1 Renderer not found, falling back to default")
+# =================================================================
 
 def to_cpu(tensor):
     return tensor.detach().cpu().numpy()
@@ -74,6 +83,29 @@ def conflict_analysis(dataset, opt, pipe, args):
     except Exception as e:
         print(f"[Error] Failed to load checkpoint: {e}")
         return
+
+    # ================= [修改 2: 加载 Mask] =================
+    # 尝试加载 anchor_source_mask.pt 以支持分裂后的模型分析
+    chk_dir = os.path.dirname(args.checkpoint)
+    mask_path = os.path.join(chk_dir, "anchor_source_mask.pt")
+    
+    # 也可以尝试在模型根目录找
+    if not os.path.exists(mask_path):
+         mask_path = os.path.join(os.path.dirname(chk_dir), "anchor_source_mask.pt")
+
+    if os.path.exists(mask_path):
+        print(f"[Scheme 1] Found Mask at: {mask_path}")
+        mask_tensor = torch.load(mask_path, map_location="cuda")
+        if mask_tensor.shape[0] == gaussians.get_anchor.shape[0]:
+            gaussians.anchor_source_mask = mask_tensor
+            print("[Scheme 1] Mask loaded successfully. Anti-ghosting active.")
+        else:
+            print(f"[Warn] Mask shape {mask_tensor.shape} mismatch with anchors {gaussians.get_anchor.shape}!")
+            gaussians.anchor_source_mask = None
+    else:
+        print("[Info] No Mask found. Assuming standard model.")
+        gaussians.anchor_source_mask = None
+    # ========================================================
 
     # --- [特殊功能] 路面调试模式 ---
     if args.debug_road:
@@ -165,7 +197,8 @@ def conflict_analysis(dataset, opt, pipe, args):
     EPOCHS = args.epochs
     print(f"\n[5/7] Running Full Coverage Analysis ({EPOCHS} Epochs)...")
     
-    import gaussian_renderer
+    # ================= [修改 3: 使用 custom_renderer] =================
+    # import gaussian_renderer (已移除，改用 custom_renderer)
     
     total_steps = (len(aerial_indices) + len(street_indices)) * EPOCHS
     pbar = tqdm(total=total_steps, desc="Collecting Gradients")
@@ -178,7 +211,8 @@ def conflict_analysis(dataset, opt, pipe, args):
             viewpoint_cam = all_cameras[cam_idx]
             is_aerial = cam_idx in aerial_indices
 
-            render_pkg = gaussian_renderer.render(viewpoint_cam, gaussians, pipe, scene.background)
+            # 调用 Scheme 1 渲染器
+            render_pkg = custom_renderer.render(viewpoint_cam, gaussians, pipe, scene.background)
             image = render_pkg["render"]
             visible_mask = render_pkg["visible_mask"]
 

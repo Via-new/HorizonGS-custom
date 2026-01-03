@@ -1,27 +1,22 @@
 #
 # gaussian_renderer/render_scheme1.py
 #
-# [修复版] 包含了训练所需的所有完整字段 (selection_mask, viewspace_points 等)
-# 
+# 基于 render_origin.py 修改，实现了 Scheme 1 的 Mask 过滤逻辑
+#
+
 import torch
 import math
 import gsplat
 from gsplat.cuda._wrapper import fully_fused_projection, fully_fused_projection_2dgs
 
-def render(viewpoint_camera, pc, pipe, bg_color, override_mask=None, override_color=None, force_opaque=False):
+def render(viewpoint_camera, pc, pipe, bg_color):
     """
     Render the scene with Anchor Splitting Scheme 1.
     Filters anchors based on pc.anchor_source_mask and viewpoint_camera.image_type.
     """
-    # 1. 基础几何生成与筛选
     if pc.explicit_gs:
         pc.set_gs_mask(viewpoint_camera.camera_center, viewpoint_camera.resolution_scale)
         visible_mask = pc._gs_mask
-        
-        # [Override Mask] from Debugger
-        if override_mask is not None:
-            visible_mask = visible_mask & override_mask
-
         xyz, color, opacity, scaling, rot, sh_degree, selection_mask = pc.generate_explicit_gaussians(visible_mask)
     else:
         # 1. 基础视锥剔除与 Level 选择
@@ -30,53 +25,49 @@ def render(viewpoint_camera, pc, pipe, bg_color, override_mask=None, override_co
         
         # ================= [Scheme 1 核心修改 Start] =================
         # 根据 anchor_source_mask 和 相机类型 进一步筛选
+        # Mask 定义: 0=仅航拍(Air), 1=仅街景(Street), 2=共享(Shared)
         if hasattr(pc, "anchor_source_mask") and pc.anchor_source_mask is not None:
             # 获取相机类型，默认为 aerial 以防万一
             cam_type = getattr(viewpoint_camera, "image_type", "aerial")
             
+            # --- [新增] 埋点统计 (调试用) ---
+            # 统计一下在进行 Mask 过滤前，视锥内包含多少种类的点
+            # n_src0 = (visible_mask & (pc.anchor_source_mask == 0)).sum().item()
+            # n_src1 = (visible_mask & (pc.anchor_source_mask == 1)).sum().item()
+            # print(f"\n[DEBUG] Before Filter ({cam_type}): Air-Only={n_src0}, Street-Only={n_src1}")
+            # -----------------------------
+
             if cam_type == "aerial":
-                # 航拍视角：屏蔽 (Source==1, 即街景专用点)
+                # 航拍视角：屏蔽 (Source==1)
                 valid_source = (pc.anchor_source_mask != 1)
                 visible_mask = visible_mask & valid_source
             elif cam_type == "street":
-                # 街景视角：屏蔽 (Source==0, 即航拍专用点)
+                # 街景视角：屏蔽 (Source==0)
                 valid_source = (pc.anchor_source_mask != 0)
                 visible_mask = visible_mask & valid_source
+            
+            # --- [新增] 验证过滤结果 (核心) ---
+            # 只有当这里打印出 0 时，才说明策略生效了！
+            if cam_type == "aerial":
+                leak_count = (visible_mask & (pc.anchor_source_mask == 1)).sum().item()
+                if leak_count > 0:
+                    print(f"❌ [ERROR] Aerial View contains {leak_count} Street-Only points!")
+                else:
+                    # 为了不刷屏，可以每隔几帧打印一次，或者只打印一次
+                    # print(f"✅ [OK] Aerial View: 0 Street-Only points.")
+                    pass
+            elif cam_type == "street":
+                leak_count = (visible_mask & (pc.anchor_source_mask == 0)).sum().item()
+                if leak_count > 0:
+                    print(f"❌ [ERROR] Street View contains {leak_count} Air-Only points!")
+                else:
+                    # print(f"✅ [OK] Street View: 0 Air-Only points.")
+                    pass
+            # -------------------------------
+
         # ================= [Scheme 1 核心修改 End] =================
 
-        # [Override Mask] from Debugger
-        if override_mask is not None:
-            visible_mask = visible_mask & override_mask
-
         xyz, offset, color, opacity, scaling, rot, sh_degree, selection_mask = pc.generate_neural_gaussians(viewpoint_camera, visible_mask)
-
-    # 2. [Color Overrides] 颜色覆盖逻辑
-    if override_color is not None:
-        try:
-            if override_color.device != visible_mask.device:
-                override_color = override_color.to(visible_mask.device)
-
-            visible_colors = override_color[visible_mask]
-
-            if not pc.explicit_gs:
-                k = getattr(pc, "n_offsets", 1)
-                visible_colors = visible_colors.repeat_interleave(k, dim=0) 
-                
-                if selection_mask is not None:
-                    if visible_colors.shape[0] != xyz.shape[0] and selection_mask.shape[0] == visible_colors.shape[0]:
-                        visible_colors = visible_colors[selection_mask]
-            
-            if visible_colors.shape[0] == xyz.shape[0]:
-                SH_C0 = 0.28209479177387814
-                color = (visible_colors - 0.5) / SH_C0
-                color = color.unsqueeze(1) 
-                sh_degree = 0 
-        except Exception as e:
-            print(f"[Render Error] Failed to apply override_color: {e}")
-
-    # 3. [Force Opaque] 强制不透明
-    if force_opaque:
-        opacity = torch.ones_like(opacity) * 0.99
 
     # Set up rasterization configuration
     K = torch.tensor([
@@ -126,7 +117,7 @@ def render(viewpoint_camera, pc, pipe, bg_color, override_mask=None, override_co
         )
     else:
         raise ValueError(f"Unknown gs_attr: {pc.gs_attr}")
-    
+
     # [1, H, W, 3] -> [3, H, W]
     if render_colors.shape[-1] == 4:
         colors, depths = render_colors[..., 0:3], render_colors[..., 3:4]
@@ -137,26 +128,24 @@ def render(viewpoint_camera, pc, pipe, bg_color, override_mask=None, override_co
 
     rendered_image = colors[0].permute(2, 0, 1)
     radii = info["radii"].squeeze(0) # [N,]
-    
-    # [CRITICAL FOR TRAINING] 必须保留梯度，否则无法训练
     try:
-        info["means2d"].retain_grad()
+        info["means2d"].retain_grad() # [1, N, 2]
     except:
         pass
 
     render_alphas = render_alphas[0].permute(2, 0, 1)
 
-    # 构造完整的返回字典，包含训练所需的所有字段
+    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     return_dict = {
         "render": rendered_image,
         "scaling": scaling,
-        "viewspace_points": info["means2d"],  # [FIX] 训练必须
+        "viewspace_points": info["means2d"],
         "visibility_filter" : radii > 0,
         "visible_mask": visible_mask,
-        "selection_mask": selection_mask,     # [FIX] Neural GS 训练必须
+        "selection_mask": selection_mask,
         "opacity": opacity,
         "render_depth": depth,
-        "radii": radii,                       # [FIX] 统计必须
+        "radii": radii,
         "render_alphas": render_alphas,
     }
     
@@ -170,11 +159,15 @@ def render(viewpoint_camera, pc, pipe, bg_color, override_mask=None, override_co
     return return_dict
 
 def prefilter_voxel(viewpoint_camera, pc):
-    # (此函数保持不变)
+    """
+    Render the scene. 
+    Background tensor (bg_color) must be on GPU!
+    """
     means = pc.get_anchor[pc._anchor_mask]
     scales = pc.get_scaling[pc._anchor_mask][:, :3]
     quats = pc.get_rotation[pc._anchor_mask]
     
+    # Set up rasterization configuration
     Ks = torch.tensor([
             [viewpoint_camera.fx, 0, viewpoint_camera.cx],
             [0, viewpoint_camera.fy, viewpoint_camera.cy],
@@ -184,19 +177,46 @@ def prefilter_voxel(viewpoint_camera, pc):
 
     N = means.shape[0]
     C = viewmats.shape[0]
+    device = means.device
     
+    # Project Gaussians to 2D. 
     if pc.gs_attr == "3D":
         proj_results = fully_fused_projection(
-            means, None, quats, scales, viewmats, Ks,
-            int(viewpoint_camera.image_width), int(viewpoint_camera.image_height),
-            eps2d=0.3, packed=False, near_plane=0.01, far_plane=1e10, radius_clip=0.0, sparse_grad=False, calc_compensations=False,
+            means,
+            None,  # covars,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            int(viewpoint_camera.image_width),
+            int(viewpoint_camera.image_height),
+            eps2d=0.3,
+            packed=False,
+            near_plane=0.01,
+            far_plane=1e10,
+            radius_clip=0.0,
+            sparse_grad=False,
+            calc_compensations=False,
         )
     elif pc.gs_attr == "2D":
-        densifications = torch.zeros((C, N, 2), dtype=means.dtype, device="cuda")
+        densifications = (
+            torch.zeros((C, N, 2), dtype=means.dtype, device="cuda")
+        )
         proj_results = fully_fused_projection_2dgs(
-            means, quats, scales, viewmats, densifications, Ks,
-            int(viewpoint_camera.image_width), int(viewpoint_camera.image_height),
-            eps2d=0.3, packed=False, near_plane=0.01, far_plane=1e10, radius_clip=0.0, sparse_grad=False,
+            means,
+            quats,
+            scales,
+            viewmats,
+            densifications,
+            Ks,
+            int(viewpoint_camera.image_width),
+            int(viewpoint_camera.image_height),
+            eps2d=0.3,
+            packed=False,
+            near_plane=0.01,
+            far_plane=1e10,
+            radius_clip=0.0,
+            sparse_grad=False,
         )
     else:
         raise ValueError(f"Unknown gs_attr: {pc.gs_attr}")

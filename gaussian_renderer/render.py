@@ -8,40 +8,43 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+
 import torch
 import math
 import gsplat
 from gsplat.cuda._wrapper import fully_fused_projection, fully_fused_projection_2dgs
 
-def render(viewpoint_camera, pc, pipe, bg_color, override_mask=None, override_color=None):
+def render(viewpoint_camera, pc, pipe, bg_color, override_mask=None, override_color=None, force_opaque=False):
     """
     Render the scene. 
     
     Args:
         override_mask (Tensor, optional): If provided, ONLY renders anchors where mask is True.
-        override_color (Tensor, optional): [N_anchors, 3] RGB Tensor (values 0-1).
-                                           If provided, forces visible points to use this color.
-                                           Useful for visualizing debug attributes (e.g. Red/Blue/Green conflicts).
+        override_color (Tensor, optional): [N_anchors, 3] RGB Tensor. Forces visible points to use this color.
+        force_opaque (bool, optional): If True, forces opacity to ~1.0 for visualization clarity.
     """
+    # 1. 基础几何生成与筛选
     if pc.explicit_gs:
         pc.set_gs_mask(viewpoint_camera.camera_center, viewpoint_camera.resolution_scale)
         visible_mask = pc._gs_mask
+        
+        # [Override Mask]
+        if override_mask is not None:
+            visible_mask = visible_mask & override_mask
+
         xyz, color, opacity, scaling, rot, sh_degree, selection_mask = pc.generate_explicit_gaussians(visible_mask)
     else:
         pc.set_anchor_mask(viewpoint_camera.camera_center, viewpoint_camera.resolution_scale)
         visible_mask = prefilter_voxel(viewpoint_camera, pc).squeeze() if pipe.add_prefilter else pc._anchor_mask    
         
-        # ================= [Filter by Override Mask] =================
+        # [Override Mask]
         if override_mask is not None:
             # Intersection: Visible AND in Override Mask
             visible_mask = visible_mask & override_mask
-        # =============================================================
 
         xyz, offset, color, opacity, scaling, rot, sh_degree, selection_mask = pc.generate_neural_gaussians(viewpoint_camera, visible_mask)
 
-    # ================= [Color Overrides] =================
-    
-    # 1. Priority: Explicit Color Override (e.g. for Multi-color Conflict Debugging)
+    # 2. [Color Overrides] 颜色覆盖逻辑
     if override_color is not None:
         try:
             # Ensure override_color is on the correct device
@@ -49,88 +52,44 @@ def render(viewpoint_camera, pc, pipe, bg_color, override_mask=None, override_co
                 override_color = override_color.to(visible_mask.device)
 
             # A. Extract colors for currently visible anchors
+            # override_color 长度是所有锚点的数量，我们需要取 visible_mask 对应的部分
             visible_colors = override_color[visible_mask] # [N_visible_anchors, 3]
 
             # B. Handle Neural Expansion (1 Anchor -> k Gaussians)
+            # 如果是神经高斯（HorizonGS），一个锚点会生成 k 个高斯，颜色需要复制
             if not pc.explicit_gs:
                 k = getattr(pc, "n_offsets", 1)
                 # Expand colors: [ColorA, ColorB] -> [ColorA, ColorA..., ColorB, ColorB...]
                 visible_colors = visible_colors.repeat_interleave(k, dim=0) 
                 
-                # C. Handle Pruning (if generate_neural_gaussians dropped some offsets)
+                # C. Handle Pruning (if generate_neural_gaussians dropped some offsets based on opacity)
                 if selection_mask is not None:
-                    # Check shape compatibility
+                    # selection_mask 是 generate_neural_gaussians 内部生成的，用于剔除透明度极低的高斯
+                    # 它的长度等于 N_visible_anchors * k
                     if visible_colors.shape[0] != xyz.shape[0] and selection_mask.shape[0] == visible_colors.shape[0]:
                         visible_colors = visible_colors[selection_mask]
             
-            # D. Final Shape Check
+            # D. Final Shape Check & Apply
             if visible_colors.shape[0] == xyz.shape[0]:
                 # Convert RGB to SH DC component
-                # SH_0 = (RGB - 0.5) / C0
+                # Formula: SH_0 = (RGB - 0.5) / C0
                 SH_C0 = 0.28209479177387814
                 
                 # Apply override
                 color = (visible_colors - 0.5) / SH_C0
                 color = color.unsqueeze(1) # [N_gaussians, 1, 3]
-                sh_degree = 0
+                sh_degree = 0 # [重要] 强制使用 DC 颜色，忽略高阶 SH
             else:
+                # 形状不匹配（极少情况），跳过覆盖
                 pass 
 
         except Exception as e:
             print(f"[Render Error] Failed to apply override_color: {e}")
 
-    # 2. Secondary: Debug Level Color (Only if not already overridden)
-    elif getattr(pc, "debug_level_color", False):
-        try:
-            # 1. 获取可见锚点的 Level 数据
-            valid_levels = pc.get_level[visible_mask].flatten() 
-
-            # 2. 对齐 Level 数量到高斯球数量
-            if not pc.explicit_gs:
-                k = pc.n_offsets
-                potential_levels = valid_levels.repeat_interleave(k)
-                if selection_mask is not None:
-                    gauss_levels = potential_levels[selection_mask]
-                else:
-                    gauss_levels = potential_levels
-            else:
-                if selection_mask is not None and selection_mask.shape[0] == valid_levels.shape[0]:
-                    gauss_levels = valid_levels[selection_mask]
-                else:
-                    gauss_levels = valid_levels
-
-            # 3. 检查形状匹配
-            if gauss_levels.shape[0] == xyz.shape[0]:
-                SH_C0 = 0.28209479177387814
-                
-                def get_sh_color(r, g, b):
-                    return torch.tensor([
-                        (r - 0.5) / SH_C0, 
-                        (g - 0.5) / SH_C0, 
-                        (b - 0.5) / SH_C0
-                    ], device=xyz.device)
-
-                debug_colors = torch.zeros_like(xyz) 
-
-                # Level 0 -> Red
-                mask_l0 = (gauss_levels == 0)
-                if mask_l0.any(): debug_colors[mask_l0] = get_sh_color(1.0, 0.0, 0.0)
-                
-                # Level 1 -> Blue
-                mask_l1 = (gauss_levels == 1)
-                if mask_l1.any(): debug_colors[mask_l1] = get_sh_color(0.0, 0.0, 1.0)
-                
-                # Level 2+ -> Green
-                mask_l2 = (gauss_levels >= 2)
-                if mask_l2.any(): debug_colors[mask_l2] = get_sh_color(0.0, 1.0, 0.0)
-
-                color = debug_colors.unsqueeze(1) 
-                sh_degree = 0
-            else:
-                pass 
-        except Exception as e:
-            print(f"[DebugColor Error] {e}")
-    # ================================================================
+    # 3. [Force Opaque] 强制不透明 (用于 Debug 分类)
+    if force_opaque:
+        # 强制设置为 0.99 (完全不透明)
+        opacity = torch.ones_like(opacity) * 0.99
 
     # Set up rasterization configuration
     K = torch.tensor([
@@ -180,7 +139,7 @@ def render(viewpoint_camera, pc, pipe, bg_color, override_mask=None, override_co
         )
     else:
         raise ValueError(f"Unknown gs_attr: {pc.gs_attr}")
-
+    
     # [1, H, W, 3] -> [3, H, W]
     if render_colors.shape[-1] == 4:
         colors, depths = render_colors[..., 0:3], render_colors[..., 3:4]
@@ -242,13 +201,8 @@ def prefilter_voxel(viewpoint_camera, pc):
     N = means.shape[0]
     C = viewmats.shape[0]
     device = means.device
-    assert means.shape == (N, 3), means.shape
-    assert quats.shape == (N, 4), quats.shape
-    assert scales.shape == (N, 3), scales.shape
-    assert viewmats.shape == (C, 4, 4), viewmats.shape
-    assert Ks.shape == (C, 3, 3), Ks.shape
-
-    # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
+    
+    # Project Gaussians to 2D. 
     if pc.gs_attr == "3D":
         proj_results = fully_fused_projection(
             means,
@@ -271,8 +225,6 @@ def prefilter_voxel(viewpoint_camera, pc):
         densifications = (
             torch.zeros((C, N, 2), dtype=means.dtype, device="cuda")
         )
-        # Project Gaussians to 2D. 
-        # [Fixed]: Removed calc_compensations argument for 2DGS
         proj_results = fully_fused_projection_2dgs(
             means,
             quats,
@@ -292,9 +244,7 @@ def prefilter_voxel(viewpoint_camera, pc):
     else:
         raise ValueError(f"Unknown gs_attr: {pc.gs_attr}")
     
-    # The results are with shape [C, N, ...]. Only the elements with radii > 0 are valid.
     radii, means2d, depths, conics, compensations = proj_results
-    camera_ids, gaussian_ids = None, None
     
     visible_mask = pc._anchor_mask.clone()
     visible_mask[pc._anchor_mask] = radii.squeeze(0) > 0

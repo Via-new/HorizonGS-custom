@@ -2,9 +2,11 @@
 .vscode
 temp*
 outputs*
+output*
 debug*
 log*
 wandb*
+RoMa
 *.bak
 data
 *build/*

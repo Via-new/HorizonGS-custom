@@ -22,7 +22,7 @@ model_params: {
     pretrained_checkpoint: debug_split_model,
     global_appearance: '',            # 全局外观模型路径（此处为空）
     dataset_name: my_experiment, # 数据集名称
-    scene_name: experiment7/test1/fine, # 场景名称/子目录，标注为fine(精细)阶段
+    scene_name: experiment7/test3/fine3, # 场景名称/子目录，标注为fine(精细)阶段
     images: images,                   # 图像文件夹名称
     resolution: -1,                   # 图像分辨率缩放，-1表示使用原始分辨率
     white_background: False,          # 是否使用白色背景（通常False表示黑色背景）
@@ -55,8 +55,8 @@ pipeline_params: {
 # Optimization Parameters (优化器参数)
 optim_params: {
     iterations: 40000,               # 总训练迭代次数
-    position_lr_init: 0.000000,      # 位置学习率初始值（0表示Fine阶段不移动点的位置，只修外观）
-    position_lr_final: 0.000000,     # 位置学习率最终值
+    position_lr_init: 0.00032,      # 位置学习率初始值（0表示Fine阶段不移动点的位置，只修外观）
+    position_lr_final: 0.0000016,     # 位置学习率最终值
     position_lr_delay_mult: 0.010000,# 位置学习率延迟乘数
     position_lr_max_steps: 40000,    # 位置学习率调整的最大步数
     

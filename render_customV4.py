@@ -70,6 +70,8 @@ def keyboard_listener_thread():
     print(">>> Keyboard Control Enabled <<<")
     print("Move: W/S (X), A/D (Y), Q/E (Z)")
     print("Rotate: I/K (Pitch), J/L (Yaw), U/O (Roll)")
+    print("Adjust Steps: Arrows")
+    print("Adjust Steps: Arrows")
     print("Press Ctrl+C to exit.")
     
     set_terminal_raw_mode()
@@ -82,6 +84,58 @@ def keyboard_listener_thread():
                     time.sleep(0.01)
                     continue
                 
+                
+                # === [新增: 方向键调整步长] ===
+                if key == '\x1b':
+                    try:
+                        seq = sys.stdin.read(2)
+                        if seq and len(seq) == 2:
+                            global MOVE_STEP, ANGLE_STEP
+                            updated = False
+                            if seq == '[A': # Up: Increase MOVE_STEP
+                                MOVE_STEP += 0.001
+                                updated = True
+                            elif seq == '[B': # Down: Decrease MOVE_STEP
+                                MOVE_STEP = max(0.0001, MOVE_STEP - 0.001)
+                                updated = True
+                            elif seq == '[D': # Left: Increase ANGLE_STEP
+                                ANGLE_STEP += 0.01
+                                updated = True
+                            elif seq == '[C': # Right: Decrease ANGLE_STEP
+                                ANGLE_STEP = max(0.01, ANGLE_STEP - 0.01)
+                                updated = True
+                            
+                            if updated:
+                                print(f"\r[Step] Move: {MOVE_STEP:.4f} | Angle: {ANGLE_STEP:.3f}      ", end="", flush=True)
+                                continue
+                    except IOError: pass
+                # ==============================
+                
+                # === [新增: 方向键调整步长] ===
+                if key == '\x1b':
+                    try:
+                        seq = sys.stdin.read(2)
+                        if seq and len(seq) == 2:
+                            global MOVE_STEP, ANGLE_STEP
+                            updated = False
+                            if seq == '[A': # Up: Increase MOVE_STEP
+                MOVE_STEP += 0.001
+                updated = True
+                            elif seq == '[B': # Down: Decrease MOVE_STEP
+                MOVE_STEP = max(0.0001, MOVE_STEP - 0.001)
+                updated = True
+                            elif seq == '[D': # Left: Increase ANGLE_STEP
+                ANGLE_STEP += 0.01
+                updated = True
+                            elif seq == '[C': # Right: Decrease ANGLE_STEP
+                ANGLE_STEP = max(0.01, ANGLE_STEP - 0.01)
+                updated = True
+                                            
+                            if updated:
+                print(f"\r[Step] Move: {MOVE_STEP:.4f} | Angle: {ANGLE_STEP:.3f}      ", end="", flush=True)
+                continue
+                    except IOError: pass
+                                # ==============================
                 key = key.lower()
                 need_print = False 
                 

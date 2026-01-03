@@ -60,12 +60,15 @@ class Camera(nn.Module):
         
         if gt_depth is not None:
             if data_format == 'colmap':
-                invdepthmapScaled = gt_depth * depth_params["scale"] + depth_params["offset"]
-                invdepthmapScaled = cv2.resize(invdepthmapScaled, resolution)
-                invdepthmapScaled[invdepthmapScaled < 0] = 0
-                if invdepthmapScaled.ndim != 2:
-                    invdepthmapScaled = invdepthmapScaled[..., 0]
-                self.invdepthmap = torch.from_numpy(invdepthmapScaled[None]).to(self.data_device)
+                if depth_params is not None:
+                    if depth_params is not None:
+                        if depth_params is not None:
+                            invdepthmapScaled = gt_depth * depth_params["scale"] + depth_params["offset"]
+                            invdepthmapScaled = cv2.resize(invdepthmapScaled, resolution)
+                            invdepthmapScaled[invdepthmapScaled < 0] = 0
+                            if invdepthmapScaled.ndim != 2:
+                                invdepthmapScaled = invdepthmapScaled[..., 0]
+                            self.invdepthmap = torch.from_numpy(invdepthmapScaled[None]).to(self.data_device)
                 
             elif data_format == 'blender' or data_format == 'city':
                 gt_depth = torch.from_numpy(cv2.resize(gt_depth, resolution)[None])

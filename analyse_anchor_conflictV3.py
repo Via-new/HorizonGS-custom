@@ -1,5 +1,5 @@
 #
-# HorizonGS Anchor Conflict Analysis Tool V3.5 (Z-Min Filter + Road Debug)
+# HorizonGS Anchor Conflict Analysis Tool V3.6 (Cyan & Purple Only)
 # 
 import os
 import torch
@@ -13,7 +13,6 @@ from tqdm import tqdm
 import logging
 import shutil 
 
-# 引入 HorizonGS 模块
 from scene import Scene
 from utils.general_utils import safe_state, parse_cfg 
 from utils.loss_utils import l1_loss, ssim
@@ -74,50 +73,6 @@ def conflict_analysis(dataset, opt, pipe, args):
     except Exception as e:
         print(f"[Error] Failed to load checkpoint: {e}")
         return
-
-    # --- [特殊功能] 路面调试模式 ---
-    if args.debug_road:
-        print("\n" + "="*60)
-        print("  !!! DEBUG ROAD MODE ACTIVATED !!!")
-        print("  Skipping conflict analysis. Extracting road slice...")
-        print("="*60)
-        
-        output_dir = "debug_road_extract"
-        if os.path.exists(output_dir): shutil.rmtree(output_dir)
-        os.makedirs(output_dir, exist_ok=True)
-
-        anchors_z = gaussians.get_anchor[:, 2]
-        
-        # 自动推断路面高度 (10% 分位点)
-        if args.road_z is None:
-            road_z = torch.quantile(anchors_z, 0.1).item()
-            print(f"  > Auto-detected Road Z: {road_z:.2f}")
-        else:
-            road_z = args.road_z
-            print(f"  > Using Manual Road Z: {road_z:.2f}")
-            
-        # 提取切片
-        margin = 0.2
-        mask_road = (anchors_z > (road_z - margin)) & (anchors_z < (road_z + margin))
-        
-        n_road = mask_road.sum().item()
-        print(f"  > Found {n_road} anchors in range [{road_z - margin:.2f}, {road_z + margin:.2f}]")
-        
-        if n_road > 0:
-            all_xyz = to_cpu(gaussians.get_anchor)
-            subset_xyz = all_xyz[to_cpu(mask_road).astype(bool)]
-            
-            # 白色显示
-            subset_colors = np.ones_like(subset_xyz) * 255 
-            subset_colors = subset_colors.astype(np.uint8)
-            
-            ply_path = os.path.join(output_dir, "road_slice.ply")
-            storePly(ply_path, subset_xyz, subset_colors)
-            print(f"  [Save] Road Slice -> {ply_path}")
-        
-        print("\nDone (Debug Road).")
-        return
-    # --------------------------------
 
     gaussians.training_setup(opt)
     gaussians.train()
@@ -252,10 +207,10 @@ def conflict_analysis(dataset, opt, pipe, args):
     mask_height_max = anchors_z < z_threshold
     print(f"   > Z-Max Filter (< {z_threshold:.2f}) : Removed {(~mask_height_max).sum().item()} points")
 
-    # 2. [新增] 高度下限过滤
+    # 2. 高度下限过滤
     z_min_threshold = args.z_min
     mask_height_min = anchors_z > z_min_threshold
-    print(f"   > Z-Min Filter (> {z_min_threshold:.2f}) : Removed {(~mask_height_min).sum().item()} points (Underground/Background)")
+    print(f"   > Z-Min Filter (> {z_min_threshold:.2f}) : Removed {(~mask_height_min).sum().item()} points")
 
     # 3. 距离过滤
     anchors_dist = torch.norm(gaussians.get_anchor, dim=1)
@@ -270,7 +225,6 @@ def conflict_analysis(dataset, opt, pipe, args):
     mask_scale = max_scales < scale_threshold
     print(f"   > Scale Filter (< {scale_threshold:.1f})   : Removed {(~mask_scale).sum().item()} points")
 
-    # 更新基础Mask
     base_mask = mask_height_max & mask_height_min & mask_dist & mask_scale & valid_street 
     
     print("-" * 60)
@@ -304,29 +258,33 @@ def conflict_analysis(dataset, opt, pipe, args):
     ratio_street_air = norm_street / (norm_air + 1e-8)
     mask_geom_asym = base_mask & (norm_street > mag_threshold_street) & (ratio_street_air > 5.0)
 
-    # --- 输出 ---
-    combined_mask = mask_opa_conflict | mask_geom_pull | mask_geom_asym | mask_street_neg
+    # ==========================
+    # [修改] 目标筛选逻辑: 只选青色和紫色
+    # ==========================
+    mask_dual = (mask_opa_conflict | mask_street_neg) & (mask_geom_pull | mask_geom_asym) # PURPLE
+    
+    # 注意：mask_geom_asym 包含了 Purple 的一部分，这里我们取并集
+    # 只要是 悬浮(Cyan) 或者 双重冲突(Purple)，都选中
+    combined_mask = mask_geom_asym | mask_dual 
+    
     combined_indices = torch.nonzero(combined_mask).squeeze()
     
+    # 为了可视化方便，还是生成所有颜色的 map
     color_map = torch.zeros((num_anchors, 3), dtype=torch.float32, device="cuda")
     color_map[mask_street_neg] = torch.tensor([0.0, 1.0, 0.0], device="cuda") # Green
     color_map[mask_geom_asym] = torch.tensor([0.0, 1.0, 1.0], device="cuda") # Cyan
     color_map[mask_opa_conflict] = torch.tensor([1.0, 0.0, 0.0], device="cuda") # Red
     color_map[mask_geom_pull] = torch.tensor([1.0, 1.0, 0.0], device="cuda") # Yellow
-    
-    mask_dual = (mask_opa_conflict | mask_street_neg) & (mask_geom_pull | mask_geom_asym)
     color_map[mask_dual] = torch.tensor([1.0, 0.0, 1.0], device="cuda") # Purple
 
     n_total = combined_mask.sum().item()
     print("=" * 60)
-    print(f"GRADIENT DIAGNOSIS REPORT")
-    print(f"Range: {z_min_threshold} < Z < {z_threshold:.2f}")
+    print(f"GRADIENT DIAGNOSIS REPORT (TARGET: CYAN & PURPLE)")
     print("-" * 60)
-    print(f"  > [GREEN]  Street-Only Negative : {mask_street_neg.sum().item()}")
     print(f"  > [CYAN]   Street-Dominant Move : {mask_geom_asym.sum().item()}")
-    print(f"  > [RED]    Classic Opacity Conf : {mask_opa_conflict.sum().item()}")
-    print(f"  > [YELLOW] Classic Geometric Pull: {mask_geom_pull.sum().item()}")
-    print(f"  > [TOTAL]  Split Candidates     : {n_total}")
+    print(f"  > [PURPLE] Dual Conflict        : {mask_dual.sum().item()}")
+    print("-" * 60)
+    print(f"  > TOTAL SELECTED FOR SPLIT      : {n_total}")
     print("=" * 60)
 
     # 8. 保存结果
@@ -340,7 +298,7 @@ def conflict_analysis(dataset, opt, pipe, args):
         valid_colors = color_map[combined_indices]
         save_dict = {"indices": combined_indices, "colors": valid_colors}
         torch.save(save_dict, os.path.join(output_dir, "conflict_indices.pt"))
-        print(f"  [Save] Conflict Data Saved.")
+        print(f"  [Save] Conflict Data -> {output_dir}/conflict_indices.pt")
     else:
         print("  [Info] No conflicts found.")
 
@@ -364,12 +322,12 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--quantile', type=float, default=0.0)
-    parser.add_argument('--z_limit', type=float, default=None, help="Z轴上限")
-    parser.add_argument('--z_min', type=float, default=-2.0, help="Z轴下限 (去除地下背景)")
+    parser.add_argument('--z_limit', type=float, default=None)
+    parser.add_argument('--z_min', type=float, default=-2.0)
     parser.add_argument('--dist_limit', type=float, default=500.0)
     parser.add_argument('--scale_limit', type=float, default=3.0)
-    parser.add_argument('--debug_road', action='store_true', help="开启路面提取模式")
-    parser.add_argument('--road_z', type=float, default=None, help="手动指定路面Z值")
+    parser.add_argument('--debug_road', action='store_true')
+    parser.add_argument('--road_z', type=float, default=None)
     parser.add_argument("--gpu", type=str, default='0')
     
     args = parser.parse_args()

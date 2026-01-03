@@ -70,7 +70,7 @@ def get_rotation_matrix(rx, ry, rz):
 # ================= 线程 1: 键盘监听 =================
 def keyboard_listener_thread():
     # === [修改提示信息] ===
-    print(">>> Keyboard: W/S/A/D/Q/E (Move), I/K/J/L/U/O (Rot), 'C' (Toggle Level Color) <<<")
+    print(">>> Keyboard: W/S/A/D/Q/E (Move), I/K/J/L/U/O (Rot), 'C' (Toggle Level Color), Arrows (Adjust Steps) <<<")
     set_terminal_raw_mode()
     try:
         while IS_RUNNING:
@@ -79,6 +79,32 @@ def keyboard_listener_thread():
                 if not key:
                     time.sleep(0.01)
                     continue
+                
+                # === [新增: 方向键调整步长] ===
+                if key == '\x1b':
+                    try:
+                        seq = sys.stdin.read(2)
+                        if seq and len(seq) == 2:
+                            global MOVE_STEP, ANGLE_STEP
+                            updated = False
+                            if seq == '[A': # Up: Increase MOVE_STEP
+                                MOVE_STEP += 0.001
+                                updated = True
+                            elif seq == '[B': # Down: Decrease MOVE_STEP
+                                MOVE_STEP = max(0.0001, MOVE_STEP - 0.001)
+                                updated = True
+                            elif seq == '[D': # Left: Increase ANGLE_STEP
+                                ANGLE_STEP += 0.01
+                                updated = True
+                            elif seq == '[C': # Right: Decrease ANGLE_STEP
+                                ANGLE_STEP = max(0.01, ANGLE_STEP - 0.01)
+                                updated = True
+                            
+                            if updated:
+                                print(f"\r[Step] Move: {MOVE_STEP:.4f} | Angle: {ANGLE_STEP:.3f}      ", end="", flush=True)
+                                continue
+                    except IOError: pass
+                # ==============================
                 
                 key = key.lower()
                 need_print = False 

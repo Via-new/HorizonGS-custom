@@ -394,6 +394,20 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     first_iter = int(first_iter)
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress", leave=True, dynamic_ncols=True, mininterval=0.5)
     first_iter += 1
+    # 模型初始化先评估一次
+    # ========================== [在这里插入代码] ==========================
+    # 强制执行一次评估 (Evaluation)
+    if logger: logger.info(f"\n[PRE-TRAIN EVALUATION] Checking model state at iter {first_iter}...")
+    with torch.no_grad():
+        training_report(
+            tb_writer, dataset_name, first_iter, 
+            torch.tensor(0.0), torch.tensor(0.0), l1_loss, 0, 
+            [first_iter],  # 关键：将当前iter放入列表，骗过函数内部的 if check
+            scene, custom_renderer.render, (pipe, scene.background), 
+            wandb, logger
+        )
+    # ====================================================================
+    
     modules = __import__('gaussian_renderer')
     
     # --- Training Loop ---
@@ -564,15 +578,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     densify_cnt += 1 
 
                 if opt.densification and iteration > opt.update_from and densify_cnt > 0 and densify_cnt % opt.update_interval == 0:
-                    if dataset.pretrained_checkpoint != "":
-                        gaussians.roll_back()
+                    # if dataset.pretrained_checkpoint != "":
+                    #     gaussians.roll_back()
                     # [Caution] Densification might mess up the mask indices!
                     gaussians.run_densify(opt, iteration)
             
-            elif iteration == opt.update_until:
-                if dataset.pretrained_checkpoint != "":
-                    gaussians.roll_back()
-                gaussians.clean()
+            # elif iteration == opt.update_until:
+            #     if dataset.pretrained_checkpoint != "":
+            #         gaussians.roll_back()
+            #     gaussians.clean()
                     
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
@@ -807,9 +821,33 @@ def render_sets(dataset, opt, pipe, iteration, skip_train=False, skip_test=False
         modules = __import__('scene')
         model_config = dataset.model_config
         gaussians = getattr(modules, model_config['name'])(**model_config['kwargs'])
+        
         # Load model at specific iteration
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, logger=logger)
         gaussians.eval()
+
+        # ================= [FIX: 加载 Scheme 1 的 Mask] =================
+        # 必须在这里重新加载 mask，否则 render_sets 会渲染出重影
+        loaded_iter = scene.loaded_iter
+        mask_path = os.path.join(dataset.model_path, "point_cloud", f"iteration_{loaded_iter}", "anchor_source_mask.pt")
+        
+        # 如果找不到，尝试一下根目录 (兼容性)
+        if not os.path.exists(mask_path):
+             mask_path = os.path.join(dataset.model_path, "anchor_source_mask.pt")
+
+        if os.path.exists(mask_path):
+            if logger: logger.info(f"[Eval] Found Anchor Source Mask: {mask_path}")
+            mask_tensor = torch.load(mask_path, map_location="cuda")
+            
+            # 校验形状
+            if mask_tensor.shape[0] == gaussians.get_anchor.shape[0]:
+                gaussians.anchor_source_mask = mask_tensor
+                if logger: logger.info("[Eval] Mask loaded successfully. Scheme 1 active.")
+            else:
+                if logger: logger.warning(f"[Eval] Mask shape {mask_tensor.shape} mismatch with anchors {gaussians.get_anchor.shape}! Ignoring.")
+        else:
+             if logger: logger.warning("[Eval] No Anchor Source Mask found! Rendering will contain Ghosting artifacts!")
+        # ================================================================
 
         if not os.path.exists(dataset.model_path):
             os.makedirs(dataset.model_path)
